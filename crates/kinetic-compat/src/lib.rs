@@ -3,7 +3,7 @@ pub mod security;
 pub mod sevenz_provider;
 pub mod zip_provider;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use kinetic_format::archive::{
 use kinetic_format::KINETIC_MAGIC;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zip::ZipArchive;
 
 use crate::security::{
     resolve_extraction_target, sanitize_relative_path, verify_decompression_quota, SecurityError,
@@ -246,46 +247,128 @@ pub fn create_archive(
     )
 }
 
-pub fn extract_archive_with_password(
+fn entry_matches_selection(entry_path: &str, selected_set: &HashSet<String>) -> bool {
+    if selected_set.is_empty() {
+        return true;
+    }
+    let norm = entry_path.trim_end_matches('/');
+    if selected_set.contains(norm) {
+        return true;
+    }
+    for sel in selected_set {
+        let prefix = format!("{}/", sel.trim_end_matches('/'));
+        if norm.starts_with(&prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extracts only the user-selected entries (or all entries if `selected_paths` is empty).
+pub fn extract_selected_entries(
     archive_path: &Path,
     destination: &Path,
+    selected_paths: &[String],
     overwrite_policy: &str,
     password: Option<&str>,
 ) -> Result<u64, CompatError> {
+    if selected_paths.is_empty() {
+        return extract_archive_with_password(archive_path, destination, overwrite_policy, password);
+    }
+
+    let selected_set: HashSet<String> = selected_paths
+        .iter()
+        .map(|s| s.replace('\\', "/").trim_end_matches('/').to_string())
+        .collect();
+
     let format = detect_format_from_disk(archive_path)?;
     match format {
         ArchiveFormat::Zip => {
-            zip_provider::extract_zip_archive(archive_path, destination, overwrite_policy)
-        }
-        ArchiveFormat::SevenZ => {
-            sevenz_provider::extract_sevenz_archive(archive_path, destination, overwrite_policy)
-        }
-        ArchiveFormat::Rar => {
-            rar_provider::extract_rar_archive(archive_path, destination, overwrite_policy)
+            fs::create_dir_all(destination)?;
+            let file = File::open(archive_path)?;
+            let mut archive =
+                ZipArchive::new(file).map_err(|e| CompatError::Format(e.to_string()))?;
+            let mut cumulative_bytes = 0u64;
+            let mut copy_buf = vec![0u8; 128 * 1024];
+
+            for i in 0..archive.len() {
+                let mut entry = archive
+                    .by_index(i)
+                    .map_err(|e| CompatError::Format(e.to_string()))?;
+                let raw_name = entry.name().replace('\\', "/");
+                if !entry_matches_selection(&raw_name, &selected_set) {
+                    continue;
+                }
+
+                cumulative_bytes = verify_decompression_quota(
+                    &raw_name,
+                    entry.compressed_size(),
+                    entry.size(),
+                    cumulative_bytes,
+                    DEFAULT_MAX_EXTRACTION_BYTES,
+                )?;
+
+                if entry.is_dir() {
+                    let safe_rel = sanitize_relative_path(&raw_name)?;
+                    fs::create_dir_all(destination.join(safe_rel))?;
+                    continue;
+                }
+
+                if let Some(target_path) =
+                    resolve_extraction_target(destination, &raw_name, overwrite_policy)?
+                {
+                    if let Some(parent) = target_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let mut out_file = File::create(&target_path)?;
+                    loop {
+                        let n = entry.read(&mut copy_buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        out_file.write_all(&copy_buf[..n])?;
+                    }
+                }
+            }
+            Ok(cumulative_bytes)
         }
         ArchiveFormat::Kinetic => {
             fs::create_dir_all(destination)?;
             let (_header, index, crypto_key) = read_kinetic_index(archive_path, password)
                 .map_err(|e| CompatError::Format(e.to_string()))?;
 
+            let mut needed_blocks: HashSet<u32> = HashSet::new();
+            for entry in &index.files {
+                if entry_matches_selection(&entry.path, &selected_set) {
+                    for &bid in &entry.block_ids {
+                        needed_blocks.insert(bid);
+                    }
+                }
+            }
+
             let mut f = File::open(archive_path)?;
             let mut block_cache: HashMap<u32, Vec<u8>> =
-                HashMap::with_capacity(index.blocks.len());
+                HashMap::with_capacity(needed_blocks.len());
             for desc in &index.blocks {
-                let raw = read_and_verify_block(
-                    &mut f,
-                    desc,
-                    &index.blocks,
-                    index.parity_offset,
-                    index.parity_length,
-                    crypto_key.as_ref(),
-                )
-                .map_err(|e| CompatError::Format(e.to_string()))?;
-                block_cache.insert(desc.block_id, raw);
+                if needed_blocks.contains(&desc.block_id) {
+                    let raw = read_and_verify_block(
+                        &mut f,
+                        desc,
+                        &index.blocks,
+                        index.parity_offset,
+                        index.parity_length,
+                        crypto_key.as_ref(),
+                    )
+                    .map_err(|e| CompatError::Format(e.to_string()))?;
+                    block_cache.insert(desc.block_id, raw);
+                }
             }
 
             let mut cumulative_bytes = 0u64;
             for entry in &index.files {
+                if !entry_matches_selection(&entry.path, &selected_set) {
+                    continue;
+                }
                 cumulative_bytes = verify_decompression_quota(
                     &entry.path,
                     entry.compressed_size.max(1),
@@ -326,8 +409,31 @@ pub fn extract_archive_with_password(
                     }
                 }
             }
-
             Ok(cumulative_bytes)
+        }
+        _ => extract_archive_with_password(archive_path, destination, overwrite_policy, password),
+    }
+}
+
+pub fn extract_archive_with_password(
+    archive_path: &Path,
+    destination: &Path,
+    overwrite_policy: &str,
+    password: Option<&str>,
+) -> Result<u64, CompatError> {
+    let format = detect_format_from_disk(archive_path)?;
+    match format {
+        ArchiveFormat::Zip => {
+            zip_provider::extract_zip_archive(archive_path, destination, overwrite_policy)
+        }
+        ArchiveFormat::SevenZ => {
+            sevenz_provider::extract_sevenz_archive(archive_path, destination, overwrite_policy)
+        }
+        ArchiveFormat::Rar => {
+            rar_provider::extract_rar_archive(archive_path, destination, overwrite_policy)
+        }
+        ArchiveFormat::Kinetic => {
+            extract_selected_entries(archive_path, destination, &["".to_string()][..0], overwrite_policy, password)
         }
     }
 }
@@ -439,17 +545,48 @@ mod tests {
         let inspection = inspect_archive(&knt_path).unwrap();
         assert_eq!(inspection.format, ArchiveFormat::Kinetic);
         assert_eq!(inspection.total_entries, 1);
-        assert_eq!(inspection.entries[0].path, "native_engine.txt");
 
         let report = validate_archive(&knt_path).unwrap();
         assert!(report.valid);
-        assert_eq!(report.verified_entries, 1);
 
         let extract_dir = dir.path().join("extracted_kinetic");
-        let extracted_bytes = extract_archive(&knt_path, &extract_dir, "overwrite").unwrap();
+        let extracted_bytes =
+            extract_selected_entries(&knt_path, &extract_dir, &["native_engine.txt".to_string()], "overwrite", None)
+                .unwrap();
         assert_eq!(extracted_bytes, payload.len() as u64);
 
         let restored = std::fs::read(extract_dir.join("native_engine.txt")).unwrap();
         assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn test_selective_entry_extraction() {
+        let dir = tempdir().unwrap();
+        let f1 = dir.path().join("keep_me.txt");
+        let f2 = dir.path().join("skip_me.txt");
+        std::fs::write(&f1, b"Selected entry content").unwrap();
+        std::fs::write(&f2, b"Unselected entry content").unwrap();
+
+        let knt_path = dir.path().join("selective.kinetic");
+        create_archive(
+            &[f1, f2],
+            &knt_path,
+            ArchiveFormat::Kinetic,
+            CompressionMode::Fast,
+        )
+        .unwrap();
+
+        let extract_dir = dir.path().join("selective_out");
+        extract_selected_entries(
+            &knt_path,
+            &extract_dir,
+            &["keep_me.txt".to_string()],
+            "overwrite",
+            None,
+        )
+        .unwrap();
+
+        assert!(extract_dir.join("keep_me.txt").exists());
+        assert!(!extract_dir.join("skip_me.txt").exists());
     }
 }

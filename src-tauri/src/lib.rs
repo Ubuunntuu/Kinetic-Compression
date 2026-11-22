@@ -3,8 +3,9 @@ pub mod state;
 
 use commands::{
     cancel_job_cmd, clear_recent_history, create_archive_cmd, extract_archive_cmd,
-    get_engine_status, get_live_telemetry_cmd, inspect_archive_cmd, pause_job_cmd,
-    resume_job_cmd, run_engine_pipeline_job_cmd, update_user_config, validate_archive_cmd,
+    extract_selected_cmd, get_engine_status, get_live_telemetry_cmd, inspect_archive_cmd,
+    pause_job_cmd, resume_job_cmd, run_engine_pipeline_job_cmd, update_user_config,
+    validate_archive_cmd,
 };
 use state::AppState;
 
@@ -20,6 +21,7 @@ pub fn run() {
             validate_archive_cmd,
             create_archive_cmd,
             extract_archive_cmd,
+            extract_selected_cmd,
             get_live_telemetry_cmd,
             pause_job_cmd,
             resume_job_cmd,

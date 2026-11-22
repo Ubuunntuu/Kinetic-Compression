@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 use kinetic_compat::{
-    create_archive_with_options, extract_archive_with_password, inspect_archive_with_password,
-    validate_archive_with_password, ArchiveInspection, IntegrityReport,
+    create_archive_with_options, extract_archive_with_password, extract_selected_entries,
+    inspect_archive_with_password, validate_archive_with_password, ArchiveInspection,
+    IntegrityReport,
 };
 use kinetic_core::pipeline::{
     compress_stream_parallel, decompress_blocks_parallel, PipelineJobReport,
@@ -59,6 +60,15 @@ pub struct CreateArchiveRequest {
 pub struct ExtractArchiveRequest {
     pub archive_path: String,
     pub destination_path: String,
+    pub overwrite_policy: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractSelectedRequest {
+    pub archive_path: String,
+    pub destination_path: String,
+    pub selected_paths: Vec<String>,
     pub overwrite_policy: Option<String>,
     pub password: Option<String>,
 }
@@ -398,6 +408,48 @@ pub fn extract_archive_cmd(
 }
 
 #[tauri::command]
+pub fn extract_selected_cmd(
+    request: ExtractSelectedRequest,
+    state: State<'_, AppState>,
+) -> Result<OperationResult, String> {
+    let archive_path = PathBuf::from(&request.archive_path);
+    let dest_path = PathBuf::from(&request.destination_path);
+    let policy = request
+        .overwrite_policy
+        .unwrap_or_else(|| state.config.lock().unwrap().overwrite_policy.clone());
+
+    let started = Instant::now();
+    let extracted_bytes = extract_selected_entries(
+        &archive_path,
+        &dest_path,
+        &request.selected_paths,
+        &policy,
+        request.password.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    let duration_ms = started.elapsed().as_millis().max(1) as u64;
+    let archive_bytes = std::fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
+    let throughput_mb_s =
+        ((extracted_bytes as f64) / (1024.0 * 1024.0)) / (duration_ms as f64 / 1000.0);
+
+    Ok(OperationResult {
+        success: true,
+        message: format!(
+            "Extracted {} selected items ({:.2} KB in {} ms)",
+            request.selected_paths.len(),
+            (extracted_bytes as f64) / 1024.0,
+            duration_ms
+        ),
+        archive_path: request.archive_path,
+        processed_bytes: extracted_bytes,
+        compressed_bytes: archive_bytes,
+        duration_ms,
+        throughput_mb_s,
+        compression_ratio_percent: 100.0,
+    })
+}
+
+#[tauri::command]
 pub fn get_live_telemetry_cmd(state: State<'_, AppState>) -> ProgressSnapshot {
     state.job_controller.snapshot(
         state.arena.allocated_bytes(),
@@ -445,7 +497,7 @@ pub fn run_engine_pipeline_job_cmd(
 
     let clamped_mb = payload_size_mb.clamp(4, 128);
     let pattern =
-        b"Kinetic Engine Phase 4 Multithreaded Ring-Buffer Pipeline Telemetry Stream! ";
+        b"Kinetic Engine Phase 7 Multithreaded Ring-Buffer Pipeline Telemetry Stream! ";
     let repeats = (clamped_mb * 1024 * 1024) / pattern.len();
     let dataset = pattern.repeat(repeats);
 

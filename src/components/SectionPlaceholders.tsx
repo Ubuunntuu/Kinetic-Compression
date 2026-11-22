@@ -3,29 +3,28 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   FilePlus2,
   FolderOutput,
-  FolderTree,
   Activity,
   Gauge,
   ShieldCheck,
-  Search,
   Play,
   Pause,
   RotateCcw,
   Square,
   Cpu,
   Lock,
+  UploadCloud,
+  Sliders,
 } from "lucide-react";
 import {
   ArchiveFormat,
-  ArchiveInspection,
   CompressionMode,
   EngineStatusPayload,
-  IntegrityReport,
   NavSection,
   OperationResult,
   PipelineJobReport,
   ProgressSnapshot,
 } from "../types/archive";
+import { ArchiveExplorer } from "./ArchiveExplorer";
 
 interface SectionWorkspaceProps {
   section: NavSection;
@@ -50,7 +49,20 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
   const [selectedMode, setSelectedMode] = useState<CompressionMode>(
     status.default_mode
   );
+  const [threadCount, setThreadCount] = useState<number>(
+    status.config.worker_threads
+  );
+  const [dictionarySizeKb, setDictionarySizeKb] = useState<number>(64);
+  const [solidBlocks, setSolidBlocks] = useState<boolean>(true);
+  const [fastCdcDedup, setFastCdcDedup] = useState<boolean>(
+    status.config.enable_fastcdc_dedup
+  );
+  const [kineticShield, setKineticShield] = useState<boolean>(
+    status.config.enable_kinetic_shield_parity
+  );
   const [createPassword, setCreatePassword] = useState<string>("");
+  const [dragActive, setDragActive] = useState<boolean>(false);
+
   const [opResult, setOpResult] = useState<OperationResult | null>(null);
   const [opError, setOpError] = useState<string | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
@@ -66,15 +78,10 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
   );
   const [extractPassword, setExtractPassword] = useState<string>("");
 
-  const [explorerPath, setExplorerPath] = useState<string>(
-    "C:\\projects\\kinetic compression\\bench_output\\sample.zip"
-  );
-  const [explorerPassword, setExplorerPassword] = useState<string>("");
-  const [inspection, setInspection] = useState<ArchiveInspection | null>(null);
-  const [validation, setValidation] = useState<IntegrityReport | null>(null);
-  const [searchQuery, setSearchQuery] = useState<string>("");
-
   const [telemetry, setTelemetry] = useState<ProgressSnapshot | null>(null);
+  const [throughputHistory, setThroughputHistory] = useState<number[]>(
+    Array(24).fill(0)
+  );
   const [pipelineMode, setPipelineMode] = useState<CompressionMode>(
     status.default_mode
   );
@@ -88,7 +95,13 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
     const poll = () => {
       invoke<ProgressSnapshot>("get_live_telemetry_cmd")
         .then((snap) => {
-          if (active) setTelemetry(snap);
+          if (active) {
+            setTelemetry(snap);
+            setThroughputHistory((prev) => [
+              ...prev.slice(1),
+              snap.throughput_mb_s,
+            ]);
+          }
         })
         .catch(() => {});
     };
@@ -105,6 +118,15 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
     setOpError(null);
     setOpResult(null);
     try {
+      await invoke("update_user_config", {
+        newConfig: {
+          ...status.config,
+          worker_threads: threadCount,
+          enable_fastcdc_dedup: fastCdcDedup,
+          enable_kinetic_shield_parity: kineticShield,
+        },
+      });
+
       const sources = sourceInput
         .split(";")
         .map((s) => s.trim())
@@ -149,40 +171,6 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
     }
   };
 
-  const handleInspectArchive = async () => {
-    setBusy(true);
-    setOpError(null);
-    setValidation(null);
-    try {
-      const res = await invoke<ArchiveInspection>("inspect_archive_cmd", {
-        archivePath: explorerPath,
-        password: explorerPassword.trim().length > 0 ? explorerPassword : null,
-      });
-      setInspection(res);
-      onRefreshStatus();
-    } catch (err) {
-      setOpError(String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const handleValidateArchive = async () => {
-    setBusy(true);
-    setOpError(null);
-    try {
-      const report = await invoke<IntegrityReport>("validate_archive_cmd", {
-        archivePath: explorerPath,
-        password: explorerPassword.trim().length > 0 ? explorerPassword : null,
-      });
-      setValidation(report);
-    } catch (err) {
-      setOpError(String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const handleRunPipelineJob = async () => {
     setBusy(true);
     setOpError(null);
@@ -197,6 +185,10 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
       setPipelineReport(report);
       const snap = await invoke<ProgressSnapshot>("get_live_telemetry_cmd");
       setTelemetry(snap);
+      setThroughputHistory((prev) => [
+        ...prev.slice(1),
+        report.throughput_mb_s,
+      ]);
       onRefreshStatus();
     } catch (err) {
       setOpError(String(err));
@@ -205,53 +197,80 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
     }
   };
 
-  const handlePause = async () => {
-    const snap = await invoke<ProgressSnapshot>("pause_job_cmd");
-    setTelemetry(snap);
-  };
-
-  const handleResume = async () => {
-    const snap = await invoke<ProgressSnapshot>("resume_job_cmd");
-    setTelemetry(snap);
-  };
-
-  const handleCancel = async () => {
-    const snap = await invoke<ProgressSnapshot>("cancel_job_cmd");
-    setTelemetry(snap);
-  };
+  if (section === "explorer") {
+    return (
+      <ArchiveExplorer
+        defaultOverwritePolicy={status.config.overwrite_policy}
+        onRefreshStatus={onRefreshStatus}
+      />
+    );
+  }
 
   if (section === "create") {
     return (
       <div className="card">
         <div className="card-header">
           <span className="card-title">
-            <FilePlus2 size={16} /> Create Archive (.zip, .7z, .kinetic)
+            <FilePlus2 size={16} /> Create Archive (Advanced Compression
+            Configurator)
           </span>
           <span className="badge badge-accent">
-            FastCDC Dedup + AES-256-GCM Ready
+            Default: .zip • Native: .kinetic v1.0
           </span>
         </div>
 
-        <div className="form-group">
-          <label className="form-label">
-            Source Files or Folders (Separate multiple paths with semicolon ;)
-          </label>
-          <input
-            type="text"
-            className="form-input"
-            value={sourceInput}
-            onChange={(e) => setSourceInput(e.target.value)}
-          />
+        {/* Drag and Drop Files/Folders Zone */}
+        <div
+          className={`dropzone ${dragActive ? "drag-active" : ""}`}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragActive(true);
+          }}
+          onDragLeave={() => setDragActive(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragActive(false);
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+              const droppedPaths: string[] = [];
+              for (let i = 0; i < e.dataTransfer.files.length; i++) {
+                const f = e.dataTransfer.files[i] as File & { path?: string };
+                if (f.path) droppedPaths.push(f.path);
+              }
+              if (droppedPaths.length > 0) {
+                setSourceInput(droppedPaths.join("; "));
+              }
+            }
+          }}
+        >
+          <UploadCloud size={20} style={{ marginBottom: "4px" }} />
+          <div>
+            Drag and drop files or folders here to add them to the compression
+            queue
+          </div>
         </div>
 
-        <div className="form-group">
-          <label className="form-label">Output Archive Path</label>
-          <input
-            type="text"
-            className="form-input"
-            value={outputPath}
-            onChange={(e) => setOutputPath(e.target.value)}
-          />
+        <div className="grid-2">
+          <div className="form-group">
+            <label className="form-label">
+              Source Files or Folders (Semicolon ; separated)
+            </label>
+            <input
+              type="text"
+              className="form-input"
+              value={sourceInput}
+              onChange={(e) => setSourceInput(e.target.value)}
+            />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Output Destination Path</label>
+            <input
+              type="text"
+              className="form-input"
+              value={outputPath}
+              onChange={(e) => setOutputPath(e.target.value)}
+            />
+          </div>
         </div>
 
         <div className="grid-3">
@@ -282,7 +301,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
           </div>
 
           <div className="form-group">
-            <label className="form-label">Compression Mode</label>
+            <label className="form-label">Compression Level / Mode</label>
             <select
               className="form-select"
               value={selectedMode}
@@ -300,15 +319,94 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
 
           <div className="form-group">
             <label className="form-label">
-              <Lock size={13} /> Optional AES-256-GCM Password (.kinetic)
+              Worker Thread Count (1 to {status.hardware.logical_cores})
+            </label>
+            <input
+              type="number"
+              className="form-input"
+              min={1}
+              max={status.hardware.logical_cores}
+              value={threadCount}
+              onChange={(e) =>
+                setThreadCount(
+                  Math.max(
+                    1,
+                    Math.min(
+                      status.hardware.logical_cores,
+                      Number(e.target.value) || 1
+                    )
+                  )
+                )
+              }
+            />
+          </div>
+        </div>
+
+        <div className="grid-3">
+          <div className="form-group">
+            <label className="form-label">
+              <Sliders size={13} /> Seed Dictionary / Window Size
+            </label>
+            <select
+              className="form-select"
+              value={dictionarySizeKb}
+              onChange={(e) => setDictionarySizeKb(Number(e.target.value))}
+            >
+              <option value={64}>64 KB Auto-Trained Seed Dictionary</option>
+              <option value={4096}>4 MB Block Dictionary Window</option>
+              <option value={16384}>16 MB Micro-Solid Window</option>
+              <option value={32768}>32 MB Ultra Archival Window</option>
+            </select>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">
+              <Lock size={13} /> AES-256-GCM + Argon2id Password
             </label>
             <input
               type="password"
               className="form-input"
-              placeholder="Leave blank for unencrypted archive"
+              placeholder="Optional encryption password..."
               value={createPassword}
               onChange={(e) => setCreatePassword(e.target.value)}
             />
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Advanced Kinetic Options</label>
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "4px",
+                fontSize: "12.5px",
+              }}
+            >
+              <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <input
+                  type="checkbox"
+                  checked={solidBlocks}
+                  onChange={(e) => setSolidBlocks(e.target.checked)}
+                />
+                <span>16 MB Indexed Micro-Solid Grouping</span>
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <input
+                  type="checkbox"
+                  checked={fastCdcDedup}
+                  onChange={(e) => setFastCdcDedup(e.target.checked)}
+                />
+                <span>FastCDC Global Chunk Deduplication</span>
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <input
+                  type="checkbox"
+                  checked={kineticShield}
+                  onChange={(e) => setKineticShield(e.target.checked)}
+                />
+                <span>Kinetic Shield Parity Recovery Blocks</span>
+              </label>
+            </div>
           </div>
         </div>
 
@@ -317,7 +415,8 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
           onClick={handleCreateArchive}
           disabled={busy}
         >
-          <Play size={15} /> {busy ? "Compressing..." : "Create Archive Now"}
+          <Play size={15} />{" "}
+          {busy ? "Compressing..." : "Start Multithreaded Compression"}
         </button>
 
         {opError && (
@@ -448,141 +547,16 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
     );
   }
 
-  if (section === "explorer") {
-    const filteredEntries =
-      inspection?.entries.filter((e) =>
-        e.path.toLowerCase().includes(searchQuery.toLowerCase())
-      ) || [];
-
-    return (
-      <div className="card">
-        <div className="card-header">
-          <span className="card-title">
-            <FolderTree size={16} /> Archive Explorer &amp; Integrity Validator
-          </span>
-          {inspection && (
-            <span className="badge badge-accent">
-              Format: {inspection.format} • {inspection.total_entries} Entries
-            </span>
-          )}
-        </div>
-
-        <div
-          style={{
-            display: "flex",
-            gap: "10px",
-            marginBottom: "14px",
-            alignItems: "center",
-          }}
-        >
-          <input
-            type="text"
-            className="form-input"
-            style={{ flex: 2 }}
-            placeholder="Enter path to .zip, .7z, .rar, or .kinetic archive..."
-            value={explorerPath}
-            onChange={(e) => setExplorerPath(e.target.value)}
-          />
-          <input
-            type="password"
-            className="form-input"
-            style={{ flex: 1 }}
-            placeholder="Password (if encrypted)"
-            value={explorerPassword}
-            onChange={(e) => setExplorerPassword(e.target.value)}
-          />
-          <button
-            className="btn btn-primary"
-            onClick={handleInspectArchive}
-            disabled={busy}
-          >
-            <Search size={15} /> Browse
-          </button>
-          <button
-            className="btn"
-            onClick={handleValidateArchive}
-            disabled={busy}
-          >
-            <ShieldCheck size={15} /> Verify Checksums
-          </button>
-        </div>
-
-        {opError && (
-          <div
-            className="card"
-            style={{
-              marginBottom: "14px",
-              borderColor: "var(--status-danger)",
-            }}
-          >
-            <strong>Archive Explorer Notice:</strong> {opError}
-          </div>
-        )}
-
-        {validation && (
-          <div
-            className="card"
-            style={{
-              marginBottom: "14px",
-              borderColor: "var(--status-success)",
-            }}
-          >
-            <strong>Integrity Verification Passed:</strong> {validation.message}
-          </div>
-        )}
-
-        {inspection && (
-          <>
-            <div style={{ marginBottom: "12px" }}>
-              <input
-                type="text"
-                className="form-input"
-                style={{ width: "100%" }}
-                placeholder="Filter entries by file or folder name..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-              />
-            </div>
-
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Path</th>
-                  <th>Type</th>
-                  <th>Original Size</th>
-                  <th>Compressed</th>
-                  <th>Codec / Filter</th>
-                  <th>CRC / BLAKE3 Digest</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredEntries.map((entry) => (
-                  <tr key={entry.path}>
-                    <td>{entry.path}</td>
-                    <td>{entry.is_dir ? "Folder" : "File"}</td>
-                    <td>{(entry.uncompressed_size / 1024).toFixed(1)} KB</td>
-                    <td>{(entry.compressed_size / 1024).toFixed(1)} KB</td>
-                    <td>{entry.codec_name}</td>
-                    <td style={{ fontFamily: "monospace", fontSize: "12px" }}>
-                      {entry.checksum_hex || "-"}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </>
-        )}
-      </div>
-    );
-  }
-
   if (section === "performance") {
+    const maxSpeed = Math.max(...throughputHistory, 100);
+
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: "18px" }}>
         <div className="card">
           <div className="card-header">
             <span className="card-title">
-              <Activity size={16} /> Live Operation Progress &amp; Telemetry
+              <Activity size={16} /> Real-Time Performance Monitor &amp;
+              Throughput Graph
             </span>
             <span className="badge badge-accent">
               State: {telemetry ? telemetry.state : "Idle"}
@@ -611,6 +585,32 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
                   width: `${telemetry ? telemetry.progress_percent : 0}%`,
                 }}
               />
+            </div>
+          </div>
+
+          {/* Rolling 24-Sample Throughput Sparkline Chart */}
+          <div style={{ marginBottom: "16px" }}>
+            <div
+              style={{
+                fontSize: "12px",
+                color: "var(--text-secondary)",
+                marginBottom: "6px",
+              }}
+            >
+              Rolling Throughput Telemetry (Peak Scale: {maxSpeed.toFixed(0)}{" "}
+              MB/s)
+            </div>
+            <div className="telemetry-bars">
+              {throughputHistory.map((val, idx) => (
+                <div
+                  key={idx}
+                  className="telemetry-bar"
+                  style={{
+                    height: `${Math.max(6, Math.min(100, (val / maxSpeed) * 100))}%`,
+                  }}
+                  title={`${val.toFixed(1)} MB/s`}
+                />
+              ))}
             </div>
           </div>
 
@@ -686,15 +686,27 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
           </div>
 
           <div style={{ display: "flex", gap: "10px" }}>
-            <button className="btn" onClick={handlePause}>
+            <button
+              className="btn"
+              onClick={async () =>
+                setTelemetry(await invoke<ProgressSnapshot>("pause_job_cmd"))
+              }
+            >
               <Pause size={14} /> Pause Job
             </button>
-            <button className="btn" onClick={handleResume}>
+            <button
+              className="btn"
+              onClick={async () =>
+                setTelemetry(await invoke<ProgressSnapshot>("resume_job_cmd"))
+              }
+            >
               <RotateCcw size={14} /> Resume Job
             </button>
             <button
               className="btn"
-              onClick={handleCancel}
+              onClick={async () =>
+                setTelemetry(await invoke<ProgressSnapshot>("cancel_job_cmd"))
+              }
               style={{ borderColor: "var(--status-danger)" }}
             >
               <Square size={14} /> Cancel Job
@@ -758,15 +770,6 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
               ? "Running Multithreaded Pipeline..."
               : `Run ${status.config.worker_threads}-Thread Pipeline Verification`}
           </button>
-
-          {opError && (
-            <div
-              className="card"
-              style={{ marginTop: "14px", borderColor: "var(--status-danger)" }}
-            >
-              <strong>Pipeline Error:</strong> {opError}
-            </div>
-          )}
 
           {pipelineReport && (
             <div

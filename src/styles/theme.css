@@ -396,3 +396,123 @@ body {
   border-radius: 8px;
   font-size: 13px;
 }
+/* Phase 7: Drag-and-Drop Zones, Breadcrumbs, Sortable Table & Context Menu */
+.dropzone {
+  border: 2px dashed var(--border-subtle);
+  border-radius: 10px;
+  padding: 18px;
+  text-align: center;
+  background-color: var(--bg-elevated);
+  color: var(--text-secondary);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+  margin-bottom: 14px;
+  cursor: pointer;
+}
+
+.dropzone.drag-active,
+.dropzone:hover {
+  border-color: var(--accent-primary);
+  background-color: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.breadcrumb-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.breadcrumb-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.breadcrumb-btn:hover,
+.breadcrumb-btn.active {
+  color: var(--accent-primary);
+  background-color: var(--accent-soft);
+}
+
+.sortable-th {
+  cursor: pointer;
+  user-select: none;
+}
+
+.sortable-th:hover {
+  color: var(--text-primary);
+}
+
+.explorer-row {
+  cursor: pointer;
+  transition: background-color 0.1s ease;
+}
+
+.explorer-row:hover {
+  background-color: var(--bg-hover);
+}
+
+.explorer-row.selected {
+  background-color: var(--accent-soft);
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 9999;
+  min-width: 215px;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.45);
+  padding: 6px;
+}
+
+.context-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  border-radius: 5px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.context-item:hover {
+  background-color: var(--accent-soft);
+  color: var(--accent-primary);
+}
+
+.telemetry-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 76px;
+  padding: 10px;
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+}
+
+.telemetry-bar {
+  flex: 1;
+  background-color: var(--accent-primary);
+  border-radius: 3px 3px 0 0;
+  min-height: 4px;
+  transition: height 0.2s ease;
+}
