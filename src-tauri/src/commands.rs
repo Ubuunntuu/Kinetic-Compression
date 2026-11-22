@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::time::Instant;
 use kinetic_compat::{
-    create_archive, extract_archive, inspect_archive, validate_archive, ArchiveInspection,
-    IntegrityReport,
+    create_archive_with_options, extract_archive_with_password, inspect_archive_with_password,
+    validate_archive_with_password, ArchiveInspection, IntegrityReport,
 };
 use kinetic_core::pipeline::{
     compress_stream_parallel, decompress_blocks_parallel, PipelineJobReport,
@@ -52,6 +52,7 @@ pub struct CreateArchiveRequest {
     pub output_path: String,
     pub format: ArchiveFormat,
     pub mode: CompressionMode,
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +60,7 @@ pub struct ExtractArchiveRequest {
     pub archive_path: String,
     pub destination_path: String,
     pub overwrite_policy: Option<String>,
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,10 +181,12 @@ pub fn clear_recent_history(state: State<'_, AppState>) -> EngineStatusPayload {
 #[tauri::command]
 pub fn inspect_archive_cmd(
     archive_path: String,
+    password: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ArchiveInspection, String> {
     let path = PathBuf::from(&archive_path);
-    let inspection = inspect_archive(&path).map_err(|e| e.to_string())?;
+    let inspection = inspect_archive_with_password(&path, password.as_deref())
+        .map_err(|e| e.to_string())?;
     record_recent_archive(
         &state,
         &path,
@@ -193,9 +197,12 @@ pub fn inspect_archive_cmd(
 }
 
 #[tauri::command]
-pub fn validate_archive_cmd(archive_path: String) -> Result<IntegrityReport, String> {
+pub fn validate_archive_cmd(
+    archive_path: String,
+    password: Option<String>,
+) -> Result<IntegrityReport, String> {
     let path = PathBuf::from(&archive_path);
-    validate_archive(&path).map_err(|e| e.to_string())
+    validate_archive_with_password(&path, password.as_deref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -205,7 +212,15 @@ pub fn create_archive_cmd(
 ) -> Result<OperationResult, String> {
     let sources: Vec<PathBuf> = request.source_paths.iter().map(PathBuf::from).collect();
     let out_path = PathBuf::from(&request.output_path);
-    let threads = state.config.lock().unwrap().worker_threads;
+    let (threads, dedup, entropy_bypass, parity) = {
+        let cfg = state.config.lock().unwrap();
+        (
+            cfg.worker_threads,
+            cfg.enable_fastcdc_dedup,
+            cfg.enable_entropy_bypass,
+            cfg.enable_kinetic_shield_parity,
+        )
+    };
 
     state
         .job_controller
@@ -213,7 +228,16 @@ pub fn create_archive_cmd(
     state.job_controller.set_current_file(&request.output_path);
 
     let started = Instant::now();
-    let input_bytes = match create_archive(&sources, &out_path, request.format, request.mode) {
+    let input_bytes = match create_archive_with_options(
+        &sources,
+        &out_path,
+        request.format,
+        request.mode,
+        request.password,
+        dedup,
+        entropy_bypass,
+        parity,
+    ) {
         Ok(b) => b,
         Err(e) => {
             let msg = e.to_string();
@@ -308,7 +332,12 @@ pub fn extract_archive_cmd(
         .set_current_file(&request.archive_path);
 
     let started = Instant::now();
-    let extracted_bytes = match extract_archive(&archive_path, &dest_path, &policy) {
+    let extracted_bytes = match extract_archive_with_password(
+        &archive_path,
+        &dest_path,
+        &policy,
+        request.password.as_deref(),
+    ) {
         Ok(b) => b,
         Err(e) => {
             let msg = e.to_string();
@@ -340,7 +369,7 @@ pub fn extract_archive_cmd(
             id: next_op_id,
             operation_type: "Extract".to_string(),
             target_name: target_name.clone(),
-            format: ArchiveFormat::Zip,
+            format: ArchiveFormat::Kinetic,
             mode: CompressionMode::Balanced,
             throughput_mb_s,
             compression_ratio_percent: 100.0,

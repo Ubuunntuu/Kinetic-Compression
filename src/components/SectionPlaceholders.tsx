@@ -13,6 +13,7 @@ import {
   RotateCcw,
   Square,
   Cpu,
+  Lock,
 } from "lucide-react";
 import {
   ArchiveFormat,
@@ -49,6 +50,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
   const [selectedMode, setSelectedMode] = useState<CompressionMode>(
     status.default_mode
   );
+  const [createPassword, setCreatePassword] = useState<string>("");
   const [opResult, setOpResult] = useState<OperationResult | null>(null);
   const [opError, setOpError] = useState<string | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
@@ -62,10 +64,12 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
   const [overwritePolicy, setOverwritePolicy] = useState<string>(
     status.config.overwrite_policy
   );
+  const [extractPassword, setExtractPassword] = useState<string>("");
 
   const [explorerPath, setExplorerPath] = useState<string>(
     "C:\\projects\\kinetic compression\\bench_output\\sample.zip"
   );
+  const [explorerPassword, setExplorerPassword] = useState<string>("");
   const [inspection, setInspection] = useState<ArchiveInspection | null>(null);
   const [validation, setValidation] = useState<IntegrityReport | null>(null);
   const [searchQuery, setSearchQuery] = useState<string>("");
@@ -111,6 +115,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
           output_path: outputPath,
           format: selectedFormat,
           mode: selectedMode,
+          password: createPassword.trim().length > 0 ? createPassword : null,
         },
       });
       setOpResult(res);
@@ -132,6 +137,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
           archive_path: extractArchivePath,
           destination_path: extractDestPath,
           overwrite_policy: overwritePolicy,
+          password: extractPassword.trim().length > 0 ? extractPassword : null,
         },
       });
       setOpResult(res);
@@ -150,6 +156,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
     try {
       const res = await invoke<ArchiveInspection>("inspect_archive_cmd", {
         archivePath: explorerPath,
+        password: explorerPassword.trim().length > 0 ? explorerPassword : null,
       });
       setInspection(res);
       onRefreshStatus();
@@ -166,6 +173,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
     try {
       const report = await invoke<IntegrityReport>("validate_archive_cmd", {
         archivePath: explorerPath,
+        password: explorerPassword.trim().length > 0 ? explorerPassword : null,
       });
       setValidation(report);
     } catch (err) {
@@ -220,7 +228,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
             <FilePlus2 size={16} /> Create Archive (.zip, .7z, .kinetic)
           </span>
           <span className="badge badge-accent">
-            Atomic .part Staging Enabled
+            FastCDC Dedup + AES-256-GCM Ready
           </span>
         </div>
 
@@ -246,7 +254,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
           />
         </div>
 
-        <div className="grid-2">
+        <div className="grid-3">
           <div className="form-group">
             <label className="form-label">Archive Format</label>
             <select
@@ -288,6 +296,19 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
                 </option>
               ))}
             </select>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">
+              <Lock size={13} /> Optional AES-256-GCM Password (.kinetic)
+            </label>
+            <input
+              type="password"
+              className="form-input"
+              placeholder="Leave blank for unencrypted archive"
+              value={createPassword}
+              onChange={(e) => setCreatePassword(e.target.value)}
+            />
           </div>
         </div>
 
@@ -339,7 +360,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
             <FolderOutput size={16} /> Extract Archive (.zip, .7z, .rar, .kinetic)
           </span>
           <span className="badge badge-success">
-            <ShieldCheck size={13} /> Zip-Slip &amp; Bomb Guard Active
+            <ShieldCheck size={13} /> Zip-Slip, BLAKE3 &amp; Parity Self-Healing
           </span>
         </div>
 
@@ -353,7 +374,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
           />
         </div>
 
-        <div className="grid-2">
+        <div className="grid-3">
           <div className="form-group">
             <label className="form-label">Destination Folder</label>
             <input
@@ -376,6 +397,17 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
               <option value="rename">Auto-Rename Extracted Files</option>
               <option value="ask">Block &amp; Alert If File Exists</option>
             </select>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Decryption Password (If Encrypted)</label>
+            <input
+              type="password"
+              className="form-input"
+              placeholder="Optional password..."
+              value={extractPassword}
+              onChange={(e) => setExtractPassword(e.target.value)}
+            />
           </div>
         </div>
 
@@ -446,17 +478,25 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
           <input
             type="text"
             className="form-input"
-            style={{ flex: 1 }}
+            style={{ flex: 2 }}
             placeholder="Enter path to .zip, .7z, .rar, or .kinetic archive..."
             value={explorerPath}
             onChange={(e) => setExplorerPath(e.target.value)}
+          />
+          <input
+            type="password"
+            className="form-input"
+            style={{ flex: 1 }}
+            placeholder="Password (if encrypted)"
+            value={explorerPassword}
+            onChange={(e) => setExplorerPassword(e.target.value)}
           />
           <button
             className="btn btn-primary"
             onClick={handleInspectArchive}
             disabled={busy}
           >
-            <Search size={15} /> Browse Archive
+            <Search size={15} /> Browse
           </button>
           <button
             className="btn"
@@ -511,8 +551,8 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
                   <th>Type</th>
                   <th>Original Size</th>
                   <th>Compressed</th>
-                  <th>Codec</th>
-                  <th>CRC / Digest</th>
+                  <th>Codec / Filter</th>
+                  <th>CRC / BLAKE3 Digest</th>
                 </tr>
               </thead>
               <tbody>
@@ -523,7 +563,9 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
                     <td>{(entry.uncompressed_size / 1024).toFixed(1)} KB</td>
                     <td>{(entry.compressed_size / 1024).toFixed(1)} KB</td>
                     <td>{entry.codec_name}</td>
-                    <td>{entry.checksum_hex || "-"}</td>
+                    <td style={{ fontFamily: "monospace", fontSize: "12px" }}>
+                      {entry.checksum_hex || "-"}
+                    </td>
                   </tr>
                 ))}
               </tbody>

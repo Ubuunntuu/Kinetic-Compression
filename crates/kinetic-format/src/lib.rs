@@ -1,3 +1,8 @@
+pub mod archive;
+pub mod cdc;
+pub mod crypto;
+pub mod filters;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -11,7 +16,7 @@ pub const FLAG_HAS_DICTIONARY: u32 = 0x02;
 pub const FLAG_HAS_PARITY: u32 = 0x04;
 pub const FLAG_SOLID_MICRO_BLOCKS: u32 = 0x08;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum FormatError {
     #[error("Invalid .kinetic magic signature")]
     InvalidMagic,
@@ -19,6 +24,14 @@ pub enum FormatError {
     UnsupportedVersion(u16, u16),
     #[error("Global header CRC32 checksum mismatch (expected {expected:#010x}, found {actual:#010x})")]
     HeaderChecksumMismatch { expected: u32, actual: u32 },
+    #[error("Block XXH3-64 checksum mismatch (expected {expected:#018x}, found {actual:#018x})")]
+    BlockChecksumMismatch { expected: u64, actual: u64 },
+    #[error("Corrupted .kinetic block or index: {0}")]
+    CorruptedBlock(String),
+    #[error("Cryptography / authentication error: {0}")]
+    CryptoError(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

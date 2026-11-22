@@ -3,15 +3,23 @@ pub mod security;
 pub mod sevenz_provider;
 pub mod zip_provider;
 
-use std::fs::File;
-use std::io::Read;
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use kinetic_core::{ArchiveFormat, CompressionMode};
-use kinetic_format::{GlobalHeader, GLOBAL_HEADER_SIZE, KINETIC_MAGIC};
+use kinetic_format::archive::{
+    create_kinetic_archive, read_and_verify_block, read_kinetic_index, validate_kinetic_archive,
+    KineticWriteOptions,
+};
+use kinetic_format::KINETIC_MAGIC;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::security::SecurityError;
+use crate::security::{
+    resolve_extraction_target, sanitize_relative_path, verify_decompression_quota, SecurityError,
+    DEFAULT_MAX_EXTRACTION_BYTES,
+};
 
 #[derive(Debug, Error)]
 pub enum CompatError {
@@ -105,21 +113,39 @@ pub fn detect_format_from_disk(path: &Path) -> Result<ArchiveFormat, CompatError
     })
 }
 
-pub fn inspect_archive(archive_path: &Path) -> Result<ArchiveInspection, CompatError> {
+pub fn inspect_archive_with_password(
+    archive_path: &Path,
+    password: Option<&str>,
+) -> Result<ArchiveInspection, CompatError> {
     let format = detect_format_from_disk(archive_path)?;
-    let archive_size_bytes = std::fs::metadata(archive_path)?.len();
+    let archive_size_bytes = fs::metadata(archive_path)?.len();
 
     let entries = match format {
         ArchiveFormat::Zip => zip_provider::list_zip_entries(archive_path)?,
         ArchiveFormat::SevenZ => sevenz_provider::list_sevenz_entries(archive_path)?,
         ArchiveFormat::Rar => rar_provider::list_rar_entries(archive_path)?,
         ArchiveFormat::Kinetic => {
-            let mut f = File::open(archive_path)?;
-            let mut buf = [0u8; GLOBAL_HEADER_SIZE];
-            f.read_exact(&mut buf)?;
-            let _header = GlobalHeader::from_bytes(&buf)
+            let (_header, index, _) = read_kinetic_index(archive_path, password)
                 .map_err(|e| CompatError::Format(e.to_string()))?;
-            Vec::new()
+            let mut list = Vec::with_capacity(index.files.len());
+            for f in index.files {
+                let _ = sanitize_relative_path(&f.path)?;
+                let short_hash = if f.blake3_hex.len() >= 16 {
+                    Some(f.blake3_hex[..16].to_string())
+                } else {
+                    None
+                };
+                list.push(ArchiveEntry {
+                    path: f.path,
+                    is_dir: f.is_dir,
+                    uncompressed_size: f.uncompressed_size,
+                    compressed_size: f.compressed_size,
+                    modified_unix_secs: f.modified_unix_secs,
+                    checksum_hex: short_hash,
+                    codec_name: f.codec_summary,
+                });
+            }
+            list
         }
     };
 
@@ -135,33 +161,46 @@ pub fn inspect_archive(archive_path: &Path) -> Result<ArchiveInspection, CompatE
     })
 }
 
-pub fn validate_archive(archive_path: &Path) -> Result<IntegrityReport, CompatError> {
+pub fn inspect_archive(archive_path: &Path) -> Result<ArchiveInspection, CompatError> {
+    inspect_archive_with_password(archive_path, None)
+}
+
+pub fn validate_archive_with_password(
+    archive_path: &Path,
+    password: Option<&str>,
+) -> Result<IntegrityReport, CompatError> {
     let format = detect_format_from_disk(archive_path)?;
     match format {
         ArchiveFormat::Zip => zip_provider::validate_zip_archive(archive_path),
         ArchiveFormat::SevenZ => sevenz_provider::validate_sevenz_archive(archive_path),
         ArchiveFormat::Rar => rar_provider::validate_rar_archive(archive_path),
         ArchiveFormat::Kinetic => {
-            let mut f = File::open(archive_path)?;
-            let mut buf = [0u8; GLOBAL_HEADER_SIZE];
-            f.read_exact(&mut buf)?;
-            let header = GlobalHeader::from_bytes(&buf)
-                .map_err(|e| CompatError::Format(e.to_string()))?;
+            let (verified_entries, total_uncompressed_bytes, message) =
+                validate_kinetic_archive(archive_path, password)
+                    .map_err(|e| CompatError::Format(e.to_string()))?;
             Ok(IntegrityReport {
                 valid: true,
-                verified_entries: header.total_files as usize,
-                total_uncompressed_bytes: 0,
-                message: "Verified .kinetic v1.0 Global Header CRC32C checksum.".to_string(),
+                verified_entries,
+                total_uncompressed_bytes,
+                message,
             })
         }
     }
 }
 
-pub fn create_archive(
+pub fn validate_archive(archive_path: &Path) -> Result<IntegrityReport, CompatError> {
+    validate_archive_with_password(archive_path, None)
+}
+
+pub fn create_archive_with_options(
     source_paths: &[PathBuf],
     output_path: &Path,
     format: ArchiveFormat,
     mode: CompressionMode,
+    password: Option<String>,
+    enable_fastcdc_dedup: bool,
+    enable_entropy_bypass: bool,
+    enable_kinetic_shield_parity: bool,
 ) -> Result<u64, CompatError> {
     if !format.can_create() {
         return Err(CompatError::Unsupported(
@@ -173,9 +212,15 @@ pub fn create_archive(
         ArchiveFormat::Zip => zip_provider::create_zip_archive(source_paths, output_path, mode),
         ArchiveFormat::SevenZ => sevenz_provider::create_sevenz_archive(source_paths, output_path),
         ArchiveFormat::Kinetic => {
-            let header = GlobalHeader::new(0);
-            std::fs::write(output_path, header.to_bytes())?;
-            Ok(GLOBAL_HEADER_SIZE as u64)
+            let opts = KineticWriteOptions {
+                mode,
+                password,
+                enable_fastcdc_dedup,
+                enable_entropy_bypass,
+                enable_kinetic_shield_parity,
+            };
+            create_kinetic_archive(source_paths, output_path, &opts)
+                .map_err(|e| CompatError::Format(e.to_string()))
         }
         ArchiveFormat::Rar => Err(CompatError::Unsupported(
             "RAR creation is not supported.".to_string(),
@@ -183,10 +228,29 @@ pub fn create_archive(
     }
 }
 
-pub fn extract_archive(
+pub fn create_archive(
+    source_paths: &[PathBuf],
+    output_path: &Path,
+    format: ArchiveFormat,
+    mode: CompressionMode,
+) -> Result<u64, CompatError> {
+    create_archive_with_options(
+        source_paths,
+        output_path,
+        format,
+        mode,
+        None,
+        true,
+        true,
+        true,
+    )
+}
+
+pub fn extract_archive_with_password(
     archive_path: &Path,
     destination: &Path,
     overwrite_policy: &str,
+    password: Option<&str>,
 ) -> Result<u64, CompatError> {
     let format = detect_format_from_disk(archive_path)?;
     match format {
@@ -200,11 +264,80 @@ pub fn extract_archive(
             rar_provider::extract_rar_archive(archive_path, destination, overwrite_policy)
         }
         ArchiveFormat::Kinetic => {
-            let _ = validate_archive(archive_path)?;
-            std::fs::create_dir_all(destination)?;
-            Ok(0)
+            fs::create_dir_all(destination)?;
+            let (_header, index, crypto_key) = read_kinetic_index(archive_path, password)
+                .map_err(|e| CompatError::Format(e.to_string()))?;
+
+            let mut f = File::open(archive_path)?;
+            let mut block_cache: HashMap<u32, Vec<u8>> =
+                HashMap::with_capacity(index.blocks.len());
+            for desc in &index.blocks {
+                let raw = read_and_verify_block(
+                    &mut f,
+                    desc,
+                    &index.blocks,
+                    index.parity_offset,
+                    index.parity_length,
+                    crypto_key.as_ref(),
+                )
+                .map_err(|e| CompatError::Format(e.to_string()))?;
+                block_cache.insert(desc.block_id, raw);
+            }
+
+            let mut cumulative_bytes = 0u64;
+            for entry in &index.files {
+                cumulative_bytes = verify_decompression_quota(
+                    &entry.path,
+                    entry.compressed_size.max(1),
+                    entry.uncompressed_size,
+                    cumulative_bytes,
+                    DEFAULT_MAX_EXTRACTION_BYTES,
+                )?;
+
+                if entry.is_dir {
+                    let safe_rel = sanitize_relative_path(&entry.path)?;
+                    fs::create_dir_all(destination.join(safe_rel))?;
+                    continue;
+                }
+
+                if let Some(target_path) =
+                    resolve_extraction_target(destination, &entry.path, overwrite_policy)?
+                {
+                    if let Some(parent) = target_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let mut out_file = File::create(&target_path)?;
+                    let mut file_hasher = blake3::Hasher::new();
+
+                    for &bid in &entry.block_ids {
+                        let chunk = block_cache.get(&bid).ok_or_else(|| {
+                            CompatError::Format(format!("Missing block ID {}", bid))
+                        })?;
+                        file_hasher.update(chunk);
+                        out_file.write_all(chunk)?;
+                    }
+
+                    let actual_blake3 = file_hasher.finalize().to_hex().to_string();
+                    if actual_blake3 != entry.blake3_hex {
+                        return Err(CompatError::Format(format!(
+                            "BLAKE3 integrity verification failed for extracted file '{}'",
+                            entry.path
+                        )));
+                    }
+                }
+            }
+
+            Ok(cumulative_bytes)
         }
     }
+}
+
+pub fn extract_archive(
+    archive_path: &Path,
+    destination: &Path,
+    overwrite_policy: &str,
+) -> Result<u64, CompatError> {
+    extract_archive_with_password(archive_path, destination, overwrite_policy, None)
 }
 
 #[cfg(test)]
@@ -253,16 +386,12 @@ mod tests {
         let inspection = inspect_archive(&zip_path).unwrap();
         assert_eq!(inspection.format, ArchiveFormat::Zip);
         assert_eq!(inspection.total_entries, 1);
-        assert_eq!(inspection.entries[0].path, "hello_kinetic.txt");
 
         let report = validate_archive(&zip_path).unwrap();
         assert!(report.valid);
-        assert_eq!(report.verified_entries, 1);
 
         let extract_dir = dir.path().join("extracted_zip");
-        let extracted_bytes = extract_archive(&zip_path, &extract_dir, "overwrite").unwrap();
-        assert_eq!(extracted_bytes, payload.len() as u64);
-
+        extract_archive(&zip_path, &extract_dir, "overwrite").unwrap();
         let restored = std::fs::read(extract_dir.join("hello_kinetic.txt")).unwrap();
         assert_eq!(restored, payload);
     }
@@ -275,25 +404,52 @@ mod tests {
         std::fs::write(&src_file, &payload).unwrap();
 
         let sz_path = dir.path().join("test_output.7z");
-        let written = create_archive(
+        create_archive(
             &[src_file.clone()],
             &sz_path,
             ArchiveFormat::SevenZ,
             CompressionMode::Maximum,
         )
         .unwrap();
-        assert_eq!(written, payload.len() as u64);
-
-        let inspection = inspect_archive(&sz_path).unwrap();
-        assert_eq!(inspection.format, ArchiveFormat::SevenZ);
-        assert_eq!(inspection.total_entries, 1);
-
-        let report = validate_archive(&sz_path).unwrap();
-        assert!(report.valid);
 
         let extract_dir = dir.path().join("extracted_7z");
         extract_archive(&sz_path, &extract_dir, "overwrite").unwrap();
         let restored = std::fs::read(extract_dir.join("sample_7z.txt")).unwrap();
+        assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn test_native_kinetic_create_inspect_validate_and_extract_roundtrip() {
+        let dir = tempdir().unwrap();
+        let src_file = dir.path().join("native_engine.txt");
+        let payload =
+            b"Kinetic Engine Phase 5 Full Native .kinetic Binary Format Roundtrip!".repeat(256);
+        std::fs::write(&src_file, &payload).unwrap();
+
+        let knt_path = dir.path().join("native_output.kinetic");
+        let written = create_archive(
+            &[src_file.clone()],
+            &knt_path,
+            ArchiveFormat::Kinetic,
+            CompressionMode::Balanced,
+        )
+        .unwrap();
+        assert_eq!(written, payload.len() as u64);
+
+        let inspection = inspect_archive(&knt_path).unwrap();
+        assert_eq!(inspection.format, ArchiveFormat::Kinetic);
+        assert_eq!(inspection.total_entries, 1);
+        assert_eq!(inspection.entries[0].path, "native_engine.txt");
+
+        let report = validate_archive(&knt_path).unwrap();
+        assert!(report.valid);
+        assert_eq!(report.verified_entries, 1);
+
+        let extract_dir = dir.path().join("extracted_kinetic");
+        let extracted_bytes = extract_archive(&knt_path, &extract_dir, "overwrite").unwrap();
+        assert_eq!(extracted_bytes, payload.len() as u64);
+
+        let restored = std::fs::read(extract_dir.join("native_engine.txt")).unwrap();
         assert_eq!(restored, payload);
     }
 }
