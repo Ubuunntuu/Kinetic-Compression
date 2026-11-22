@@ -1,5 +1,4 @@
 use std::fs::{self, File};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use sevenz_rust::{Password, SevenZArchiveEntry, SevenZReader, SevenZWriter};
 use walkdir::WalkDir;

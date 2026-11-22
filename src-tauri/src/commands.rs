@@ -224,10 +224,11 @@ pub fn create_archive_cmd(
         .unwrap_or_else(|| request.output_path.clone());
 
     let mut ops = state.recent_operations.lock().unwrap();
+    let next_op_id = format!("op-{}", ops.len() + 1);
     ops.insert(
         0,
         RecentOperation {
-            id: format!("op-{}", ops.len() + 1),
+            id: next_op_id,
             operation_type: "Compress".to_string(),
             target_name: target_name.clone(),
             format: request.format,
@@ -285,10 +286,11 @@ pub fn extract_archive_cmd(
         .unwrap_or_else(|| request.archive_path.clone());
 
     let mut ops = state.recent_operations.lock().unwrap();
+    let next_op_id = format!("op-{}", ops.len() + 1);
     ops.insert(
         0,
         RecentOperation {
-            id: format!("op-{}", ops.len() + 1),
+            id: next_op_id,
             operation_type: "Extract".to_string(),
             target_name: target_name.clone(),
             format: ArchiveFormat::Zip,
