@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use kinetic_compat::{
     create_archive_with_options, extract_archive_with_password, extract_selected_entries,
-    inspect_archive_with_password, validate_archive_with_password, ArchiveInspection,
+    audit_archive_security, inspect_archive_with_password, repair_archive, validate_archive_with_password, ArchiveInspection,
     IntegrityReport,
 };
 use kinetic_core::pipeline::{
@@ -541,6 +541,24 @@ pub fn run_engine_pipeline_job_cmd(
     Ok(report)
 }
 
+
+#[tauri::command]
+pub fn audit_archive_cmd(
+    archive_path: String,
+    password: Option<String>,
+) -> Result<IntegrityReport, String> {
+    let path = PathBuf::from(&archive_path);
+    audit_archive_security(&path, password.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn repair_archive_cmd(
+    archive_path: String,
+    password: Option<String>,
+) -> Result<IntegrityReport, String> {
+    let path = PathBuf::from(&archive_path);
+    repair_archive(&path, password.as_deref()).map_err(|e| e.to_string())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

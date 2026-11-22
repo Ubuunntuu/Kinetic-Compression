@@ -9,8 +9,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use kinetic_core::{ArchiveFormat, CompressionMode};
 use kinetic_format::archive::{
-    create_kinetic_archive, read_and_verify_block, read_kinetic_index, validate_kinetic_archive,
-    KineticWriteOptions,
+    create_kinetic_archive, read_and_verify_block, read_kinetic_index, repair_kinetic_archive,
+    validate_kinetic_archive, KineticWriteOptions,
 };
 use kinetic_format::KINETIC_MAGIC;
 use serde::{Deserialize, Serialize};
@@ -18,8 +18,8 @@ use thiserror::Error;
 use zip::ZipArchive;
 
 use crate::security::{
-    resolve_extraction_target, sanitize_relative_path, verify_decompression_quota, SecurityError,
-    DEFAULT_MAX_EXTRACTION_BYTES,
+    resolve_extraction_target, sanitize_relative_path, verify_decompression_quota,
+    BoundedExtractionWriter, SecurityError, DEFAULT_MAX_EXTRACTION_BYTES,
 };
 
 #[derive(Debug, Error)]
@@ -166,6 +166,65 @@ pub fn inspect_archive(archive_path: &Path) -> Result<ArchiveInspection, CompatE
     inspect_archive_with_password(archive_path, None)
 }
 
+/// Performs a pre-extraction security audit checking paths, device names, integer overflows, and bomb ratios.
+pub fn audit_archive_security(
+    archive_path: &Path,
+    password: Option<&str>,
+) -> Result<IntegrityReport, CompatError> {
+    let inspection = inspect_archive_with_password(archive_path, password)?;
+    let mut cumulative_bytes = 0u64;
+
+    for entry in &inspection.entries {
+        if !entry.path.is_empty() {
+            let _ = sanitize_relative_path(&entry.path)?;
+        }
+        cumulative_bytes = verify_decompression_quota(
+            &entry.path,
+            entry.compressed_size.max(1),
+            entry.uncompressed_size,
+            cumulative_bytes,
+            DEFAULT_MAX_EXTRACTION_BYTES,
+        )?;
+    }
+
+    Ok(IntegrityReport {
+        valid: true,
+        verified_entries: inspection.total_entries,
+        total_uncompressed_bytes: cumulative_bytes,
+        message: format!(
+            "Security Audit Passed: {} entries verified free of Zip-Slip, reserved device names, ADS, and decompression bombs.",
+            inspection.total_entries
+        ),
+    })
+}
+
+/// Attempts physical repair of a `.kinetic` archive using its Kinetic Shield XOR parity block.
+pub fn repair_archive(
+    archive_path: &Path,
+    password: Option<&str>,
+) -> Result<IntegrityReport, CompatError> {
+    let format = detect_format_from_disk(archive_path)?;
+    match format {
+        ArchiveFormat::Kinetic => {
+            let msg = repair_kinetic_archive(archive_path, password)
+                .map_err(|e| CompatError::Format(e.to_string()))?;
+            let (verified_entries, total_uncompressed_bytes, _) =
+                validate_kinetic_archive(archive_path, password)
+                    .map_err(|e| CompatError::Format(e.to_string()))?;
+            Ok(IntegrityReport {
+                valid: true,
+                verified_entries,
+                total_uncompressed_bytes,
+                message: msg,
+            })
+        }
+        _ => Err(CompatError::Unsupported(
+            "Physical parity self-healing is only supported on native .kinetic archives with Kinetic Shield enabled."
+                .to_string(),
+        )),
+    }
+}
+
 pub fn validate_archive_with_password(
     archive_path: &Path,
     password: Option<&str>,
@@ -264,7 +323,6 @@ fn entry_matches_selection(entry_path: &str, selected_set: &HashSet<String>) -> 
     false
 }
 
-/// Extracts only the user-selected entries (or all entries if `selected_paths` is empty).
 pub fn extract_selected_entries(
     archive_path: &Path,
     destination: &Path,
@@ -296,12 +354,13 @@ pub fn extract_selected_entries(
                     .by_index(i)
                     .map_err(|e| CompatError::Format(e.to_string()))?;
                 let raw_name = entry.name().replace('\\', "/");
-                if !entry_matches_selection(&raw_name, &selected_set) {
+                let trimmed = raw_name.trim_end_matches('/');
+                if !entry_matches_selection(trimmed, &selected_set) {
                     continue;
                 }
 
                 cumulative_bytes = verify_decompression_quota(
-                    &raw_name,
+                    trimmed,
                     entry.compressed_size(),
                     entry.size(),
                     cumulative_bytes,
@@ -309,24 +368,40 @@ pub fn extract_selected_entries(
                 )?;
 
                 if entry.is_dir() {
-                    let safe_rel = sanitize_relative_path(&raw_name)?;
-                    fs::create_dir_all(destination.join(safe_rel))?;
+                    if !trimmed.is_empty() {
+                        let safe_rel = sanitize_relative_path(trimmed)?;
+                        fs::create_dir_all(destination.join(safe_rel))?;
+                    }
                     continue;
                 }
 
                 if let Some(target_path) =
-                    resolve_extraction_target(destination, &raw_name, overwrite_policy)?
+                    resolve_extraction_target(destination, trimmed, overwrite_policy)?
                 {
                     if let Some(parent) = target_path.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    let mut out_file = File::create(&target_path)?;
-                    loop {
-                        let n = entry.read(&mut copy_buf)?;
-                        if n == 0 {
-                            break;
+                    let max_entry_stream = entry
+                        .size()
+                        .saturating_add(64 * 1024)
+                        .min(DEFAULT_MAX_EXTRACTION_BYTES);
+                    let write_res = (|| -> Result<(), CompatError> {
+                        let out_file = File::create(&target_path)?;
+                        let mut bounded = BoundedExtractionWriter::new(out_file, max_entry_stream);
+                        loop {
+                            let n = entry.read(&mut copy_buf)?;
+                            if n == 0 {
+                                break;
+                            }
+                            bounded.write_all(&copy_buf[..n])?;
                         }
-                        out_file.write_all(&copy_buf[..n])?;
+                        bounded.flush()?;
+                        Ok(())
+                    })();
+
+                    if let Err(e) = write_res {
+                        let _ = fs::remove_file(&target_path);
+                        return Err(e);
                     }
                 }
             }
@@ -389,7 +464,12 @@ pub fn extract_selected_entries(
                     if let Some(parent) = target_path.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    let mut out_file = File::create(&target_path)?;
+                    let max_entry_stream = entry
+                        .uncompressed_size
+                        .saturating_add(64 * 1024)
+                        .min(DEFAULT_MAX_EXTRACTION_BYTES);
+                    let out_file = File::create(&target_path)?;
+                    let mut bounded = BoundedExtractionWriter::new(out_file, max_entry_stream);
                     let mut file_hasher = blake3::Hasher::new();
 
                     for &bid in &entry.block_ids {
@@ -397,11 +477,16 @@ pub fn extract_selected_entries(
                             CompatError::Format(format!("Missing block ID {}", bid))
                         })?;
                         file_hasher.update(chunk);
-                        out_file.write_all(chunk)?;
+                        if let Err(e) = bounded.write_all(chunk) {
+                            let _ = fs::remove_file(&target_path);
+                            return Err(CompatError::Io(e));
+                        }
                     }
+                    bounded.flush()?;
 
                     let actual_blake3 = file_hasher.finalize().to_hex().to_string();
                     if actual_blake3 != entry.blake3_hex {
+                        let _ = fs::remove_file(&target_path);
                         return Err(CompatError::Format(format!(
                             "BLAKE3 integrity verification failed for extracted file '{}'",
                             entry.path
@@ -433,7 +518,14 @@ pub fn extract_archive_with_password(
             rar_provider::extract_rar_archive(archive_path, destination, overwrite_policy)
         }
         ArchiveFormat::Kinetic => {
-            extract_selected_entries(archive_path, destination, &["".to_string()][..0], overwrite_policy, password)
+            let (_header, index, _) = read_kinetic_index(archive_path, password)
+                .map_err(|e| CompatError::Format(e.to_string()))?;
+            let all_paths: Vec<String> = index.files.into_iter().map(|f| f.path).collect();
+            if all_paths.is_empty() {
+                fs::create_dir_all(destination)?;
+                return Ok(0);
+            }
+            extract_selected_entries(archive_path, destination, &all_paths, overwrite_policy, password)
         }
     }
 }
@@ -449,6 +541,7 @@ pub fn extract_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kinetic_format::archive::{cleanup_interrupted_staging_files, BLOCK_HEADER_SIZE};
     use tempfile::tempdir;
 
     #[test]
@@ -550,9 +643,7 @@ mod tests {
         assert!(report.valid);
 
         let extract_dir = dir.path().join("extracted_kinetic");
-        let extracted_bytes =
-            extract_selected_entries(&knt_path, &extract_dir, &["native_engine.txt".to_string()], "overwrite", None)
-                .unwrap();
+        let extracted_bytes = extract_archive(&knt_path, &extract_dir, "overwrite").unwrap();
         assert_eq!(extracted_bytes, payload.len() as u64);
 
         let restored = std::fs::read(extract_dir.join("native_engine.txt")).unwrap();
@@ -588,5 +679,78 @@ mod tests {
 
         assert!(extract_dir.join("keep_me.txt").exists());
         assert!(!extract_dir.join("skip_me.txt").exists());
+    }
+
+    #[test]
+    fn test_physical_disk_repair_and_staging_cleanup() {
+        let dir = tempdir().unwrap();
+        let f1 = dir.path().join("block_a.txt");
+        let f2 = dir.path().join("block_b.txt");
+        std::fs::write(&f1, b"Alpha block data for physical disk repair test".repeat(128)).unwrap();
+        std::fs::write(&f2, b"Beta block data for physical disk repair test".repeat(128)).unwrap();
+
+        // Create a stale .part file and verify cleanup_interrupted_staging_files removes it
+        let stale_part = dir.path().join("aborted.kinetic.part");
+        std::fs::write(&stale_part, b"partial data").unwrap();
+        assert_eq!(cleanup_interrupted_staging_files(dir.path()).unwrap(), 1);
+        assert!(!stale_part.exists());
+
+        let knt_path = dir.path().join("repairable.kinetic");
+        create_archive(
+            &[f1, f2],
+            &knt_path,
+            ArchiveFormat::Kinetic,
+            CompressionMode::Balanced,
+        )
+        .unwrap();
+
+        let (_hdr, index, _) = read_kinetic_index(&knt_path, None).unwrap();
+        let corrupt_pos = (index.blocks[0].file_offset as usize) + BLOCK_HEADER_SIZE + 2;
+        let mut raw = std::fs::read(&knt_path).unwrap();
+        raw[corrupt_pos] ^= 0xFF;
+        std::fs::write(&knt_path, &raw).unwrap();
+
+        let repair_report = repair_archive(&knt_path, None).unwrap();
+        assert!(repair_report.valid);
+        assert!(repair_report.message.contains("repaired corrupted Block #0"));
+    }
+
+    #[test]
+    fn test_thousand_small_files_stress_roundtrip() {
+        let dir = tempdir().unwrap();
+        let corpus_dir = dir.path().join("stress_corpus");
+        std::fs::create_dir_all(&corpus_dir).unwrap();
+
+        for i in 0..1000 {
+            let sub = corpus_dir.join(format!("module_{}", i % 10));
+            std::fs::create_dir_all(&sub).unwrap();
+            let file_path = sub.join(format!("item_{:04}.txt", i));
+            std::fs::write(
+                &file_path,
+                format!("Kinetic stress test file #{} with shared template header!\n", i).repeat(8),
+            )
+            .unwrap();
+        }
+
+        let knt_path = dir.path().join("thousand_files.kinetic");
+        create_archive(
+            &[corpus_dir],
+            &knt_path,
+            ArchiveFormat::Kinetic,
+            CompressionMode::Automatic,
+        )
+        .unwrap();
+
+        let audit = audit_archive_security(&knt_path, None).unwrap();
+        assert!(audit.valid);
+        assert!(audit.verified_entries >= 1000);
+
+        let extract_dir = dir.path().join("stress_extracted");
+        extract_archive(&knt_path, &extract_dir, "overwrite").unwrap();
+        assert!(extract_dir
+            .join("stress_corpus")
+            .join("module_7")
+            .join("item_0997.txt")
+            .exists());
     }
 }

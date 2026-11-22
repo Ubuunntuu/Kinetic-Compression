@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -782,6 +782,136 @@ pub fn validate_kinetic_archive(
         index.deduplicated_chunks_saved
     );
     Ok((verified_files, total_uncompressed, msg))
+}
+
+/// Physically repairs a damaged `.kinetic` archive on disk using the Kinetic Shield XOR parity block.
+pub fn repair_kinetic_archive(
+    archive_path: &Path,
+    password: Option<&str>,
+) -> Result<String, FormatError> {
+    let (_header, index, crypto_key) = read_kinetic_index(archive_path, password)?;
+    if index.parity_offset == 0 || index.parity_length == 0 {
+        return Err(FormatError::CorruptedBlock(
+            "Archive does not contain a Kinetic Shield parity block for physical repair.".to_string(),
+        ));
+    }
+
+    let mut f = File::open(archive_path)?;
+    let mut header_buf = [0u8; GLOBAL_HEADER_SIZE];
+    f.read_exact(&mut header_buf)?;
+    let header = GlobalHeader::from_bytes(&header_buf)?;
+    let seed_dict = load_seed_dictionary(&mut f, &header, crypto_key.as_ref())?;
+
+    let mut corrupted_blocks: Vec<BlockDescriptor> = Vec::new();
+    for desc in &index.blocks {
+        f.seek(SeekFrom::Start(desc.file_offset + (BLOCK_HEADER_SIZE as u64)))?;
+        let mut raw_payload = vec![0u8; desc.compressed_size as usize];
+        f.read_exact(&mut raw_payload)?;
+
+        let check = (|| -> Result<(), FormatError> {
+            let decrypted = if let Some((ref nonce, ref key)) = crypto_key {
+                decrypt_block_aes256_gcm(key, nonce, desc.block_id, &raw_payload)?
+            } else {
+                raw_payload
+            };
+            let _ = decode_block_payload(
+                desc.codec_id,
+                desc.filter_mask,
+                desc.uncompressed_size,
+                desc.block_xxh3_64,
+                &decrypted,
+                &seed_dict,
+            )?;
+            Ok(())
+        })();
+
+        if check.is_err() {
+            corrupted_blocks.push(desc.clone());
+        }
+    }
+
+    if corrupted_blocks.is_empty() {
+        return Ok("Archive verified clean: 0 corrupted blocks found.".to_string());
+    }
+    if corrupted_blocks.len() > 1 {
+        return Err(FormatError::CorruptedBlock(format!(
+            "Found {} corrupted blocks; single-stripe XOR parity can repair at most 1 block.",
+            corrupted_blocks.len()
+        )));
+    }
+
+    let damaged = &corrupted_blocks[0];
+    f.seek(SeekFrom::Start(index.parity_offset))?;
+    let mut recovered_payload = vec![0u8; index.parity_length as usize];
+    f.read_exact(&mut recovered_payload)?;
+
+    for other in &index.blocks {
+        if other.block_id == damaged.block_id {
+            continue;
+        }
+        f.seek(SeekFrom::Start(other.file_offset + (BLOCK_HEADER_SIZE as u64)))?;
+        let mut other_payload = vec![0u8; other.compressed_size as usize];
+        f.read_exact(&mut other_payload)?;
+        for (r, &b) in recovered_payload.iter_mut().zip(other_payload.iter()) {
+            *r ^= b;
+        }
+    }
+    recovered_payload.truncate(damaged.compressed_size as usize);
+
+    let decrypted = if let Some((ref nonce, ref key)) = crypto_key {
+        decrypt_block_aes256_gcm(key, nonce, damaged.block_id, &recovered_payload)?
+    } else {
+        recovered_payload.clone()
+    };
+    let _ = decode_block_payload(
+        damaged.codec_id,
+        damaged.filter_mask,
+        damaged.uncompressed_size,
+        damaged.block_xxh3_64,
+        &decrypted,
+        &seed_dict,
+    )?;
+
+    let mut full_bytes = fs::read(archive_path)?;
+    let payload_start = (damaged.file_offset as usize) + BLOCK_HEADER_SIZE;
+    let payload_end = payload_start + (damaged.compressed_size as usize);
+    full_bytes[payload_start..payload_end].copy_from_slice(&recovered_payload);
+
+    let repair_staging = archive_path.with_extension("kinetic.repair.part");
+    fs::write(&repair_staging, &full_bytes)?;
+    fs::rename(&repair_staging, archive_path)?;
+
+    Ok(format!(
+        "Kinetic Shield successfully repaired corrupted Block #{} ({} bytes) on disk.",
+        damaged.block_id, damaged.compressed_size
+    ))
+}
+
+/// Removes any orphaned `.part` staging files left by interrupted archive operations.
+pub fn cleanup_interrupted_staging_files(dir: &Path) -> io::Result<usize> {
+    if !dir.exists() || !dir.is_dir() {
+        return Ok(0);
+    }
+    let mut cleaned = 0usize;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if name.ends_with(".zip.part")
+                || name.ends_with(".7z.part")
+                || name.ends_with(".kinetic.part")
+                || name.ends_with(".repair.part")
+            {
+                fs::remove_file(path)?;
+                cleaned += 1;
+            }
+        }
+    }
+    Ok(cleaned)
 }
 
 #[cfg(test)]

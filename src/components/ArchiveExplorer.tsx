@@ -89,6 +89,37 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
     }
   };
 
+  const handleSecurityAudit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const report = await invoke<IntegrityReport>("audit_archive_cmd", {
+        archivePath,
+        password: password.trim().length > 0 ? password : null,
+      });
+      setValidation(report);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRepairArchive = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const report = await invoke<IntegrityReport>("repair_archive_cmd", {
+        archivePath,
+        password: password.trim().length > 0 ? password : null,
+      });
+      setValidation(report);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
   const handleValidate = async () => {
     setBusy(true);
     setError(null);
@@ -299,7 +330,7 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
         >
           <Search size={15} /> Open Archive
         </button>
-        <button className="btn" onClick={handleValidate} disabled={busy}>
+        <button className="btn" onClick={handleSecurityAudit} disabled={busy}>Security Audit</button><button className="btn" onClick={handleRepairArchive} disabled={busy}>Repair (.kinetic)</button><button className="btn" onClick={handleValidate} disabled={busy}>
           <ShieldCheck size={15} /> Verify Integrity
         </button>
       </div>

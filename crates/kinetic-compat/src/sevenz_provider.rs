@@ -1,11 +1,12 @@
 use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use sevenz_rust::{Password, SevenZArchiveEntry, SevenZReader, SevenZWriter};
 use walkdir::WalkDir;
 
 use crate::security::{
     resolve_extraction_target, sanitize_relative_path, verify_decompression_quota,
-    DEFAULT_MAX_EXTRACTION_BYTES,
+    BoundedExtractionWriter, DEFAULT_MAX_EXTRACTION_BYTES,
 };
 use crate::{ArchiveEntry, CompatError, IntegrityReport};
 
@@ -16,7 +17,10 @@ pub fn list_sevenz_entries(archive_path: &Path) -> Result<Vec<ArchiveEntry>, Com
     let mut entries = Vec::new();
     for file in &reader.archive().files {
         let raw_name = file.name().replace('\\', "/");
-        let _ = sanitize_relative_path(&raw_name)?;
+        let trimmed = raw_name.trim_end_matches('/');
+        if !trimmed.is_empty() {
+            let _ = sanitize_relative_path(trimmed)?;
+        }
 
         let crc_hex = if file.has_crc {
             Some(format!("{:08x}", file.crc as u32))
@@ -25,7 +29,7 @@ pub fn list_sevenz_entries(archive_path: &Path) -> Result<Vec<ArchiveEntry>, Com
         };
 
         entries.push(ArchiveEntry {
-            path: raw_name.trim_end_matches('/').to_string(),
+            path: trimmed.to_string(),
             is_dir: file.is_directory(),
             uncompressed_size: file.size(),
             compressed_size: file.compressed_size,
@@ -48,12 +52,15 @@ pub fn validate_sevenz_archive(archive_path: &Path) -> Result<IntegrityReport, C
 
     reader
         .for_each_entries(|entry, entry_reader| {
-            let raw_name = entry.name().to_string();
-            sanitize_relative_path(&raw_name)
-                .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
+            let raw_name = entry.name().replace('\\', "/");
+            let trimmed = raw_name.trim_end_matches('/');
+            if !trimmed.is_empty() {
+                sanitize_relative_path(trimmed)
+                    .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
+            }
 
             total_uncompressed_bytes = verify_decompression_quota(
-                &raw_name,
+                trimmed,
                 entry.compressed_size,
                 entry.size(),
                 total_uncompressed_bytes,
@@ -187,9 +194,11 @@ pub fn extract_sevenz_archive(
 
     reader
         .for_each_entries(|entry, entry_reader| {
-            let raw_name = entry.name().to_string();
+            let raw_name = entry.name().replace('\\', "/");
+            let trimmed = raw_name.trim_end_matches('/');
+
             cumulative_bytes = verify_decompression_quota(
-                &raw_name,
+                trimmed,
                 entry.compressed_size,
                 entry.size(),
                 cumulative_bytes,
@@ -198,21 +207,32 @@ pub fn extract_sevenz_archive(
             .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
 
             if entry.is_directory() {
-                let safe_rel = sanitize_relative_path(&raw_name)
-                    .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
-                fs::create_dir_all(destination.join(safe_rel))?;
+                if !trimmed.is_empty() {
+                    let safe_rel = sanitize_relative_path(trimmed)
+                        .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
+                    fs::create_dir_all(destination.join(safe_rel))?;
+                }
                 return Ok(true);
             }
 
             if let Some(target_path) =
-                resolve_extraction_target(destination, &raw_name, overwrite_policy)
+                resolve_extraction_target(destination, trimmed, overwrite_policy)
                     .map_err(|e| sevenz_rust::Error::other(e.to_string()))?
             {
                 if let Some(parent) = target_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let mut out_file = File::create(&target_path)?;
-                std::io::copy(entry_reader, &mut out_file)?;
+                let max_entry_stream = entry
+                    .size()
+                    .saturating_add(64 * 1024)
+                    .min(DEFAULT_MAX_EXTRACTION_BYTES);
+                let out_file = File::create(&target_path)?;
+                let mut bounded = BoundedExtractionWriter::new(out_file, max_entry_stream);
+                if let Err(e) = std::io::copy(entry_reader, &mut bounded) {
+                    let _ = fs::remove_file(&target_path);
+                    return Err(sevenz_rust::Error::other(e.to_string()));
+                }
+                bounded.flush()?;
             }
             Ok(true)
         })

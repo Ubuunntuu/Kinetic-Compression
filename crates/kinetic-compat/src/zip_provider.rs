@@ -8,7 +8,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::security::{
     resolve_extraction_target, sanitize_relative_path, verify_decompression_quota,
-    DEFAULT_MAX_EXTRACTION_BYTES,
+    BoundedExtractionWriter, DEFAULT_MAX_EXTRACTION_BYTES,
 };
 use crate::{ArchiveEntry, CompatError, IntegrityReport};
 
@@ -41,7 +41,9 @@ pub fn list_zip_entries(archive_path: &Path) -> Result<Vec<ArchiveEntry>, Compat
             .map_err(|e| CompatError::Format(e.to_string()))?;
 
         let raw_name = entry.name().replace('\\', "/");
-        let _ = sanitize_relative_path(&raw_name)?;
+        if !entry.is_dir() || !raw_name.trim_end_matches('/').is_empty() {
+            let _ = sanitize_relative_path(raw_name.trim_end_matches('/'))?;
+        }
 
         entries.push(ArchiveEntry {
             path: raw_name.trim_end_matches('/').to_string(),
@@ -68,8 +70,11 @@ pub fn validate_zip_archive(archive_path: &Path) -> Result<IntegrityReport, Comp
         let mut entry = archive
             .by_index(i)
             .map_err(|e| CompatError::Format(e.to_string()))?;
-        let raw_name = entry.name().to_string();
-        let _ = sanitize_relative_path(&raw_name)?;
+        let raw_name = entry.name().replace('\\', "/");
+        let trimmed = raw_name.trim_end_matches('/');
+        if !trimmed.is_empty() {
+            let _ = sanitize_relative_path(trimmed)?;
+        }
 
         total_uncompressed_bytes = verify_decompression_quota(
             &raw_name,
@@ -80,7 +85,21 @@ pub fn validate_zip_archive(archive_path: &Path) -> Result<IntegrityReport, Comp
         )?;
 
         if !entry.is_dir() {
-            while entry.read(&mut sink_buf)? > 0 {}
+            let max_entry_quota = entry.size().saturating_add(64 * 1024);
+            let mut streamed = 0u64;
+            loop {
+                let n = entry.read(&mut sink_buf)?;
+                if n == 0 {
+                    break;
+                }
+                streamed = streamed.saturating_add(n as u64);
+                if streamed > max_entry_quota {
+                    return Err(CompatError::Format(format!(
+                        "ZIP entry '{}' exceeded declared uncompressed size in header",
+                        raw_name
+                    )));
+                }
+            }
             verified_files += 1;
         }
     }
@@ -90,7 +109,7 @@ pub fn validate_zip_archive(archive_path: &Path) -> Result<IntegrityReport, Comp
         verified_entries: verified_files,
         total_uncompressed_bytes,
         message: format!(
-            "Verified {} ZIP entries ({} bytes) with zero CRC32 or path errors.",
+            "Verified {} ZIP entries ({} bytes) with zero CRC32 or security errors.",
             verified_files, total_uncompressed_bytes
         ),
     })
@@ -226,10 +245,11 @@ pub fn extract_zip_archive(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| CompatError::Format(e.to_string()))?;
-        let raw_name = entry.name().to_string();
+        let raw_name = entry.name().replace('\\', "/");
+        let trimmed = raw_name.trim_end_matches('/');
 
         cumulative_bytes = verify_decompression_quota(
-            &raw_name,
+            trimmed,
             entry.compressed_size(),
             entry.size(),
             cumulative_bytes,
@@ -237,24 +257,40 @@ pub fn extract_zip_archive(
         )?;
 
         if entry.is_dir() {
-            let safe_rel = sanitize_relative_path(&raw_name)?;
-            fs::create_dir_all(destination.join(safe_rel))?;
+            if !trimmed.is_empty() {
+                let safe_rel = sanitize_relative_path(trimmed)?;
+                fs::create_dir_all(destination.join(safe_rel))?;
+            }
             continue;
         }
 
         if let Some(target_path) =
-            resolve_extraction_target(destination, &raw_name, overwrite_policy)?
+            resolve_extraction_target(destination, trimmed, overwrite_policy)?
         {
             if let Some(parent) = target_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let mut out_file = File::create(&target_path)?;
-            loop {
-                let n = entry.read(&mut copy_buf)?;
-                if n == 0 {
-                    break;
+            let max_entry_stream = entry
+                .size()
+                .saturating_add(64 * 1024)
+                .min(DEFAULT_MAX_EXTRACTION_BYTES);
+            let write_res = (|| -> Result<(), CompatError> {
+                let out_file = File::create(&target_path)?;
+                let mut bounded = BoundedExtractionWriter::new(out_file, max_entry_stream);
+                loop {
+                    let n = entry.read(&mut copy_buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    bounded.write_all(&copy_buf[..n])?;
                 }
-                out_file.write_all(&copy_buf[..n])?;
+                bounded.flush()?;
+                Ok(())
+            })();
+
+            if let Err(e) = write_res {
+                let _ = fs::remove_file(&target_path);
+                return Err(e);
             }
         }
     }
