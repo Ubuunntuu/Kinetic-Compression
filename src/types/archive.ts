@@ -19,6 +19,14 @@ export type NavSection =
   | "settings"
   | "about";
 
+export type JobState =
+  | "Idle"
+  | "Running"
+  | "Paused"
+  | "Cancelled"
+  | "Completed"
+  | "Failed";
+
 export interface HardwareProfile {
   logical_cores: number;
   total_memory_mb: number;
@@ -117,6 +125,38 @@ export interface OperationResult {
   duration_ms: number;
   throughput_mb_s: number;
   compression_ratio_percent: number;
+}
+
+export interface ProgressSnapshot {
+  state: JobState;
+  current_operation: string;
+  current_file: string;
+  processed_bytes: number;
+  total_bytes: number;
+  compressed_bytes: number;
+  progress_percent: number;
+  compression_ratio_percent: number;
+  throughput_mb_s: number;
+  elapsed_ms: number;
+  estimated_remaining_ms: number;
+  active_threads: number;
+  cpu_usage_percent: number;
+  memory_used_mb: number;
+  arena_used_mb: number;
+  arena_peak_mb: number;
+}
+
+export interface PipelineJobReport {
+  total_blocks: number;
+  total_uncompressed_bytes: number;
+  total_compressed_bytes: number;
+  compression_ratio_percent: number;
+  throughput_mb_s: number;
+  duration_ms: number;
+  blake3_root_hash_hex: string;
+  entropy_bypassed_blocks: number;
+  worker_threads_used: number;
+  peak_arena_mb: number;
 }
 
 export interface EngineStatusPayload {

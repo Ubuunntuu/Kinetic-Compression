@@ -1,9 +1,13 @@
+pub mod memory;
+pub mod pipeline;
+pub mod progress;
+
 use serde::{Deserialize, Serialize};
 use sysinfo::{Disks, System};
 use thiserror::Error;
 
 pub const ENGINE_NAME: &str = "Kinetic Engine";
-pub const ENGINE_VERSION: &str = "0.2.0-alpha";
+pub const ENGINE_VERSION: &str = "0.4.0-alpha";
 
 #[derive(Debug, Error)]
 pub enum EngineError {

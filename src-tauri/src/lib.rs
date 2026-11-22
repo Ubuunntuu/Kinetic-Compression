@@ -2,8 +2,9 @@ pub mod commands;
 pub mod state;
 
 use commands::{
-    clear_recent_history, create_archive_cmd, extract_archive_cmd, get_engine_status,
-    inspect_archive_cmd, update_user_config, validate_archive_cmd,
+    cancel_job_cmd, clear_recent_history, create_archive_cmd, extract_archive_cmd,
+    get_engine_status, get_live_telemetry_cmd, inspect_archive_cmd, pause_job_cmd,
+    resume_job_cmd, run_engine_pipeline_job_cmd, update_user_config, validate_archive_cmd,
 };
 use state::AppState;
 
@@ -18,7 +19,12 @@ pub fn run() {
             inspect_archive_cmd,
             validate_archive_cmd,
             create_archive_cmd,
-            extract_archive_cmd
+            extract_archive_cmd,
+            get_live_telemetry_cmd,
+            pause_job_cmd,
+            resume_job_cmd,
+            cancel_job_cmd,
+            run_engine_pipeline_job_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kinetic desktop application");

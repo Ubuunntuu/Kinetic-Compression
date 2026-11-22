@@ -4,6 +4,10 @@ use kinetic_compat::{
     create_archive, extract_archive, inspect_archive, validate_archive, ArchiveInspection,
     IntegrityReport,
 };
+use kinetic_core::pipeline::{
+    compress_stream_parallel, decompress_blocks_parallel, PipelineJobReport,
+};
+use kinetic_core::progress::ProgressSnapshot;
 use kinetic_core::{
     ArchiveFormat, CompressionMode, DiskTelemetry, HardwareProfile, RecentArchive,
     RecentOperation, UserConfig, ENGINE_NAME, ENGINE_VERSION,
@@ -158,6 +162,7 @@ pub fn update_user_config(
                 .to_string(),
         );
     }
+    state.arena.set_capacity_mb(new_config.memory_arena_mb);
     let mut cfg = state.config.lock().unwrap();
     *cfg = new_config;
     drop(cfg);
@@ -200,14 +205,31 @@ pub fn create_archive_cmd(
 ) -> Result<OperationResult, String> {
     let sources: Vec<PathBuf> = request.source_paths.iter().map(PathBuf::from).collect();
     let out_path = PathBuf::from(&request.output_path);
+    let threads = state.config.lock().unwrap().worker_threads;
+
+    state
+        .job_controller
+        .begin_job("Create Archive", 0, threads);
+    state.job_controller.set_current_file(&request.output_path);
 
     let started = Instant::now();
-    let input_bytes = create_archive(&sources, &out_path, request.format, request.mode)
-        .map_err(|e| e.to_string())?;
+    let input_bytes = match create_archive(&sources, &out_path, request.format, request.mode) {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = e.to_string();
+            state.job_controller.fail_job(&msg);
+            return Err(msg);
+        }
+    };
     let elapsed = started.elapsed();
     let duration_ms = elapsed.as_millis().max(1) as u64;
 
     let compressed_bytes = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    state
+        .job_controller
+        .record_block_progress(input_bytes, compressed_bytes);
+    state.job_controller.finish_job();
+
     let throughput_mb_s =
         ((input_bytes as f64) / (1024.0 * 1024.0)) / (duration_ms as f64 / 1000.0);
     let ratio_percent = if input_bytes > 0 {
@@ -266,17 +288,42 @@ pub fn extract_archive_cmd(
 ) -> Result<OperationResult, String> {
     let archive_path = PathBuf::from(&request.archive_path);
     let dest_path = PathBuf::from(&request.destination_path);
-    let policy = request.overwrite_policy.unwrap_or_else(|| {
-        state.config.lock().unwrap().overwrite_policy.clone()
-    });
+    let (policy, threads) = {
+        let cfg = state.config.lock().unwrap();
+        (
+            request
+                .overwrite_policy
+                .clone()
+                .unwrap_or_else(|| cfg.overwrite_policy.clone()),
+            cfg.worker_threads,
+        )
+    };
+
+    let archive_bytes = std::fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
+    state
+        .job_controller
+        .begin_job("Extract Archive", archive_bytes, threads);
+    state
+        .job_controller
+        .set_current_file(&request.archive_path);
 
     let started = Instant::now();
-    let extracted_bytes =
-        extract_archive(&archive_path, &dest_path, &policy).map_err(|e| e.to_string())?;
+    let extracted_bytes = match extract_archive(&archive_path, &dest_path, &policy) {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = e.to_string();
+            state.job_controller.fail_job(&msg);
+            return Err(msg);
+        }
+    };
     let elapsed = started.elapsed();
     let duration_ms = elapsed.as_millis().max(1) as u64;
 
-    let archive_bytes = std::fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
+    state
+        .job_controller
+        .record_block_progress(extracted_bytes, archive_bytes);
+    state.job_controller.finish_job();
+
     let throughput_mb_s =
         ((extracted_bytes as f64) / (1024.0 * 1024.0)) / (duration_ms as f64 / 1000.0);
 
@@ -319,6 +366,98 @@ pub fn extract_archive_cmd(
         throughput_mb_s,
         compression_ratio_percent: 100.0,
     })
+}
+
+#[tauri::command]
+pub fn get_live_telemetry_cmd(state: State<'_, AppState>) -> ProgressSnapshot {
+    state.job_controller.snapshot(
+        state.arena.allocated_bytes(),
+        state.arena.peak_bytes(),
+    )
+}
+
+#[tauri::command]
+pub fn pause_job_cmd(state: State<'_, AppState>) -> ProgressSnapshot {
+    state.job_controller.pause();
+    state.job_controller.snapshot(
+        state.arena.allocated_bytes(),
+        state.arena.peak_bytes(),
+    )
+}
+
+#[tauri::command]
+pub fn resume_job_cmd(state: State<'_, AppState>) -> ProgressSnapshot {
+    state.job_controller.resume();
+    state.job_controller.snapshot(
+        state.arena.allocated_bytes(),
+        state.arena.peak_bytes(),
+    )
+}
+
+#[tauri::command]
+pub fn cancel_job_cmd(state: State<'_, AppState>) -> ProgressSnapshot {
+    state.job_controller.cancel();
+    state.job_controller.snapshot(
+        state.arena.allocated_bytes(),
+        state.arena.peak_bytes(),
+    )
+}
+
+#[tauri::command]
+pub fn run_engine_pipeline_job_cmd(
+    mode: CompressionMode,
+    payload_size_mb: usize,
+    state: State<'_, AppState>,
+) -> Result<PipelineJobReport, String> {
+    let (threads, entropy_bypass) = {
+        let cfg = state.config.lock().unwrap();
+        (cfg.worker_threads, cfg.enable_entropy_bypass)
+    };
+
+    let clamped_mb = payload_size_mb.clamp(4, 128);
+    let pattern =
+        b"Kinetic Engine Phase 4 Multithreaded Ring-Buffer Pipeline Telemetry Stream! ";
+    let repeats = (clamped_mb * 1024 * 1024) / pattern.len();
+    let dataset = pattern.repeat(repeats);
+
+    let (blocks, report) = compress_stream_parallel(
+        &dataset,
+        &format!("Kinetic_Memory_Stream_{}MB.bin", clamped_mb),
+        mode,
+        threads,
+        entropy_bypass,
+        &state.arena,
+        &state.job_controller,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let restored =
+        decompress_blocks_parallel(&blocks, threads, &state.job_controller)
+            .map_err(|e| e.to_string())?;
+
+    if restored.len() != dataset.len() {
+        return Err("Pipeline verification failed: restored length mismatch.".to_string());
+    }
+
+    let mut ops = state.recent_operations.lock().unwrap();
+    let next_op_id = format!("op-{}", ops.len() + 1);
+    ops.insert(
+        0,
+        RecentOperation {
+            id: next_op_id,
+            operation_type: "Pipeline Verify".to_string(),
+            target_name: format!("{} MB Stream ({} Blocks)", clamped_mb, report.total_blocks),
+            format: ArchiveFormat::Kinetic,
+            mode,
+            throughput_mb_s: report.throughput_mb_s,
+            compression_ratio_percent: report.compression_ratio_percent,
+            duration_ms: report.duration_ms,
+            status: "XXH3 + BLAKE3 Verified".to_string(),
+        },
+    );
+    ops.truncate(20);
+
+    Ok(report)
 }
 
 #[cfg(test)]
