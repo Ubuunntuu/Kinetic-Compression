@@ -14,5 +14,6 @@ sysinfo.workspace = true
 crossbeam-channel.workspace = true
 lz4_flex.workspace = true
 flate2.workspace = true
+brotli.workspace = true
 xxhash-rust.workspace = true
 blake3.workspace = true

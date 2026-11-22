@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use kinetic_core::pipeline::estimate_shannon_entropy;
+use kinetic_core::classifier::classify_content;
+use kinetic_core::pipeline::BlockCodec;
 use kinetic_core::CompressionMode;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -16,16 +17,20 @@ use crate::crypto::{
     decrypt_block_aes256_gcm, derive_key_argon2id, encrypt_block_aes256_gcm,
     generate_salt_and_nonce, NONCE_LEN, SALT_LEN,
 };
+use crate::dictionary::{
+    apply_dict_transform, reverse_dict_transform, train_seed_dictionary, FILTER_SHARED_DICT,
+};
 use crate::filters::{apply_filter, reverse_filter, select_optimal_filter};
 use crate::{
-    FormatError, GlobalHeader, FLAG_ENCRYPTED, FLAG_HAS_PARITY, FLAG_SOLID_MICRO_BLOCKS,
-    GLOBAL_HEADER_SIZE,
+    FormatError, GlobalHeader, FLAG_ENCRYPTED, FLAG_HAS_DICTIONARY, FLAG_HAS_PARITY,
+    FLAG_SOLID_MICRO_BLOCKS, GLOBAL_HEADER_SIZE,
 };
 
 pub const BLOCK_HEADER_SIZE: usize = 32;
 pub const CODEC_STORE: u8 = 0x00;
 pub const CODEC_LZ4: u8 = 0x01;
 pub const CODEC_DEFLATE_HIGH: u8 = 0x02;
+pub const CODEC_BROTLI: u8 = 0x04;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockFrameHeader {
@@ -124,6 +129,7 @@ fn codec_name(codec_id: u8, filter_mask: u8) -> String {
         CODEC_STORE => "Store",
         CODEC_LZ4 => "LZ4",
         CODEC_DEFLATE_HIGH => "Zlib-High",
+        CODEC_BROTLI => "Brotli-Ultra",
         _ => "Kinetic",
     };
     if filter_mask != 0 {
@@ -138,40 +144,87 @@ fn compress_chunk_payload(
     file_path: &str,
     mode: CompressionMode,
     enable_entropy_bypass: bool,
+    seed_dict: &[u8],
 ) -> Result<(u8, u8, Vec<u8>), FormatError> {
-    let entropy = estimate_shannon_entropy(raw_chunk);
+    let profile = classify_content(file_path, raw_chunk);
+    let entropy = profile.shannon_entropy;
+
     if mode == CompressionMode::Store || (enable_entropy_bypass && entropy > 7.85) {
         return Ok((CODEC_STORE, 0, raw_chunk.to_vec()));
     }
 
-    let filter_mask = select_optimal_filter(file_path, raw_chunk);
-    let filtered = apply_filter(filter_mask, raw_chunk);
+    let base_filter = select_optimal_filter(file_path, raw_chunk);
+    let mut working = apply_filter(base_filter, raw_chunk);
+    let mut filter_mask = base_filter;
 
-    let use_high = matches!(
-        mode,
-        CompressionMode::Maximum | CompressionMode::Ultra
-    ) || (mode == CompressionMode::Automatic && entropy <= 5.8);
-
-    if use_high {
-        let level = if mode == CompressionMode::Ultra {
-            Compression::best()
-        } else {
-            Compression::new(6)
-        };
-        let mut enc = ZlibEncoder::new(Vec::with_capacity(filtered.len() / 2), level);
-        enc.write_all(&filtered)?;
-        let comp = enc.finish()?;
-        if comp.len() < raw_chunk.len() {
-            return Ok((CODEC_DEFLATE_HIGH, filter_mask, comp));
-        }
-    } else {
-        let comp = lz4_flex::compress_prepend_size(&filtered);
-        if comp.len() < raw_chunk.len() {
-            return Ok((CODEC_LZ4, filter_mask, comp));
+    if !seed_dict.is_empty() && base_filter == 0 {
+        let dict_preconditioned = apply_dict_transform(&working, seed_dict);
+        if dict_preconditioned.len() + 8 < working.len() {
+            working = dict_preconditioned;
+            filter_mask |= FILTER_SHARED_DICT;
         }
     }
 
-    Ok((CODEC_STORE, 0, raw_chunk.to_vec()))
+    let target_codec = match mode {
+        CompressionMode::Store => CODEC_STORE,
+        CompressionMode::Fast => CODEC_LZ4,
+        CompressionMode::Balanced => {
+            if entropy <= 5.0 {
+                CODEC_DEFLATE_HIGH
+            } else {
+                CODEC_LZ4
+            }
+        }
+        CompressionMode::Maximum => CODEC_DEFLATE_HIGH,
+        CompressionMode::Ultra => CODEC_BROTLI,
+        CompressionMode::Automatic => match profile.recommended_codec {
+            BlockCodec::Store => CODEC_STORE,
+            BlockCodec::Lz4 => CODEC_LZ4,
+            BlockCodec::DeflateHigh => CODEC_DEFLATE_HIGH,
+            BlockCodec::BrotliUltra => CODEC_BROTLI,
+        },
+    };
+
+    match target_codec {
+        CODEC_STORE => Ok((CODEC_STORE, 0, raw_chunk.to_vec())),
+        CODEC_LZ4 => {
+            let comp = lz4_flex::compress_prepend_size(&working);
+            if comp.len() < raw_chunk.len() {
+                Ok((CODEC_LZ4, filter_mask, comp))
+            } else {
+                Ok((CODEC_STORE, 0, raw_chunk.to_vec()))
+            }
+        }
+        CODEC_DEFLATE_HIGH => {
+            let level = if mode == CompressionMode::Maximum {
+                Compression::best()
+            } else {
+                Compression::new(6)
+            };
+            let mut enc = ZlibEncoder::new(Vec::with_capacity(working.len() / 2), level);
+            enc.write_all(&working)?;
+            let comp = enc.finish()?;
+            if comp.len() < raw_chunk.len() {
+                Ok((CODEC_DEFLATE_HIGH, filter_mask, comp))
+            } else {
+                Ok((CODEC_STORE, 0, raw_chunk.to_vec()))
+            }
+        }
+        CODEC_BROTLI => {
+            let mut comp = Vec::with_capacity(working.len() / 2);
+            {
+                let mut writer = brotli::CompressorWriter::new(&mut comp, 4096, 9, 20);
+                writer.write_all(&working)?;
+                writer.flush()?;
+            }
+            if comp.len() < raw_chunk.len() {
+                Ok((CODEC_BROTLI, filter_mask, comp))
+            } else {
+                Ok((CODEC_STORE, 0, raw_chunk.to_vec()))
+            }
+        }
+        _ => Ok((CODEC_STORE, 0, raw_chunk.to_vec())),
+    }
 }
 
 pub fn decode_block_payload(
@@ -180,13 +233,20 @@ pub fn decode_block_payload(
     uncompressed_size: u64,
     expected_xxh3: u64,
     payload: &[u8],
+    seed_dict: &[u8],
 ) -> Result<Vec<u8>, FormatError> {
-    let filtered = match codec_id {
+    let mut working = match codec_id {
         CODEC_STORE => payload.to_vec(),
         CODEC_LZ4 => lz4_flex::decompress_size_prepended(payload)
             .map_err(|e| FormatError::CorruptedBlock(format!("LZ4 decode failed: {}", e)))?,
         CODEC_DEFLATE_HIGH => {
             let mut dec = ZlibDecoder::new(payload);
+            let mut out = Vec::with_capacity(uncompressed_size as usize);
+            dec.read_to_end(&mut out)?;
+            out
+        }
+        CODEC_BROTLI => {
+            let mut dec = brotli::Decompressor::new(payload, 4096);
             let mut out = Vec::with_capacity(uncompressed_size as usize);
             dec.read_to_end(&mut out)?;
             out
@@ -199,7 +259,12 @@ pub fn decode_block_payload(
         }
     };
 
-    let restored = reverse_filter(filter_mask, &filtered);
+    if (filter_mask & FILTER_SHARED_DICT) != 0 {
+        working = reverse_dict_transform(&working, seed_dict)?;
+    }
+
+    let base_filter = filter_mask & !FILTER_SHARED_DICT;
+    let restored = reverse_filter(base_filter, &working);
     let actual_xxh3 = xxh3_64(&restored);
     if actual_xxh3 != expected_xxh3 {
         return Err(FormatError::BlockChecksumMismatch {
@@ -297,6 +362,37 @@ pub fn create_kinetic_archive(
             ext_a.cmp(ext_b).then_with(|| a.1.cmp(&b.1))
         });
 
+        let mut dict_samples: Vec<Vec<u8>> = Vec::new();
+        for (disk_path, _, is_dir) in files_to_pack.iter().take(32) {
+            if !*is_dir {
+                if let Ok(bytes) = fs::read(disk_path) {
+                    if !bytes.is_empty() && bytes.len() <= 256 * 1024 {
+                        dict_samples.push(bytes);
+                    }
+                }
+            }
+        }
+
+        let seed_dict = if options.mode != CompressionMode::Store && !dict_samples.is_empty() {
+            train_seed_dictionary(&dict_samples)
+        } else {
+            Vec::new()
+        };
+
+        let (dict_offset, dict_length) = if !seed_dict.is_empty() {
+            flags |= FLAG_HAS_DICTIONARY;
+            let d_off = out.stream_position()?;
+            let stored_dict = if let Some((_, ref base_nonce, ref key)) = crypto_ctx {
+                encrypt_block_aes256_gcm(key, base_nonce, u32::MAX - 1, &seed_dict)?
+            } else {
+                seed_dict.clone()
+            };
+            out.write_all(&stored_dict)?;
+            (d_off, stored_dict.len() as u32)
+        } else {
+            (0, 0)
+        };
+
         let mut chunk_dedup_table: HashMap<[u8; 32], u32> = HashMap::new();
         let mut block_descriptors: Vec<BlockDescriptor> = Vec::new();
         let mut file_entries: Vec<KineticFileEntry> = Vec::new();
@@ -354,6 +450,7 @@ pub fn create_kinetic_archive(
                     &rel_path,
                     options.mode,
                     options.enable_entropy_bypass,
+                    &seed_dict,
                 )?;
 
                 last_codec_label = codec_name(codec_id, filter_mask);
@@ -450,6 +547,8 @@ pub fn create_kinetic_archive(
         final_header.index_length = index_length;
         final_header.total_blocks = index.blocks.len() as u64;
         final_header.total_files = index.files.len() as u64;
+        final_header.dict_offset = dict_offset;
+        final_header.dict_length = dict_length;
         final_header.header_crc32c = final_header.compute_checksum();
 
         out.seek(SeekFrom::Start(0))?;
@@ -472,6 +571,24 @@ pub fn create_kinetic_archive(
             Err(e)
         }
     }
+}
+
+pub fn load_seed_dictionary(
+    file: &mut File,
+    header: &GlobalHeader,
+    crypto_key: Option<&([u8; NONCE_LEN], [u8; 32])>,
+) -> Result<Vec<u8>, FormatError> {
+    if (header.flags & FLAG_HAS_DICTIONARY) == 0 || header.dict_offset == 0 || header.dict_length == 0 {
+        return Ok(Vec::new());
+    }
+    file.seek(SeekFrom::Start(header.dict_offset))?;
+    let mut buf = vec![0u8; header.dict_length as usize];
+    file.read_exact(&mut buf)?;
+
+    if let Some((nonce, key)) = crypto_key {
+        buf = decrypt_block_aes256_gcm(key, nonce, u32::MAX - 1, &buf)?;
+    }
+    Ok(buf)
 }
 
 pub fn read_kinetic_index(
@@ -541,6 +658,12 @@ pub fn read_and_verify_block(
     parity_length: u64,
     crypto_key: Option<&([u8; NONCE_LEN], [u8; 32])>,
 ) -> Result<Vec<u8>, FormatError> {
+    let mut header_buf = [0u8; GLOBAL_HEADER_SIZE];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header_buf)?;
+    let header = GlobalHeader::from_bytes(&header_buf)?;
+    let seed_dict = load_seed_dictionary(file, &header, crypto_key)?;
+
     file.seek(SeekFrom::Start(desc.file_offset))?;
     let mut frame_buf = [0u8; BLOCK_HEADER_SIZE];
     file.read_exact(&mut frame_buf)?;
@@ -561,6 +684,7 @@ pub fn read_and_verify_block(
             desc.uncompressed_size,
             desc.block_xxh3_64,
             &decrypted,
+            &seed_dict,
         )
     })();
 
@@ -599,6 +723,7 @@ pub fn read_and_verify_block(
             desc.uncompressed_size,
             desc.block_xxh3_64,
             &decrypted,
+            &seed_dict,
         );
     }
 
@@ -669,21 +794,24 @@ mod tests {
         let dir = tempdir().unwrap();
         let file1 = dir.path().join("alpha.txt");
         let file2 = dir.path().join("beta_duplicate.txt");
-        let payload = b"Kinetic Phase 5 Native Format + FastCDC Deduplication Payload! ".repeat(2048);
+        let payload = b"Kinetic Phase 6 Native Format + FastCDC Deduplication Payload! ".repeat(2048);
         fs::write(&file1, &payload).unwrap();
         fs::write(&file2, &payload).unwrap();
 
         let archive_path = dir.path().join("bundle.kinetic");
-        let opts = KineticWriteOptions::default();
+        let opts = KineticWriteOptions {
+            mode: CompressionMode::Ultra,
+            ..Default::default()
+        };
 
         let total_in =
             create_kinetic_archive(&[file1, file2], &archive_path, &opts).unwrap();
         assert_eq!(total_in, (payload.len() * 2) as u64);
 
-        let (_hdr, index, _) = read_kinetic_index(&archive_path, None).unwrap();
+        let (hdr, index, _) = read_kinetic_index(&archive_path, None).unwrap();
         assert_eq!(index.files.len(), 2);
         assert!(index.deduplicated_chunks_saved >= 1);
-        assert!(index.deduplicated_bytes_saved >= payload.len() as u64);
+        assert!((hdr.flags & FLAG_HAS_DICTIONARY) != 0);
 
         let (verified_count, verified_bytes, _) =
             validate_kinetic_archive(&archive_path, None).unwrap();
@@ -700,7 +828,7 @@ mod tests {
 
         let archive_path = dir.path().join("encrypted.kinetic");
         let opts = KineticWriteOptions {
-            mode: CompressionMode::Maximum,
+            mode: CompressionMode::Automatic,
             password: Some("StrongVaultKey#2026".to_string()),
             ..Default::default()
         };

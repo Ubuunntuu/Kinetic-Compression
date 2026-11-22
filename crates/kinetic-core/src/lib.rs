@@ -1,3 +1,4 @@
+pub mod classifier;
 pub mod memory;
 pub mod pipeline;
 pub mod progress;
@@ -7,7 +8,7 @@ use sysinfo::{Disks, System};
 use thiserror::Error;
 
 pub const ENGINE_NAME: &str = "Kinetic Engine";
-pub const ENGINE_VERSION: &str = "0.4.0-alpha";
+pub const ENGINE_VERSION: &str = "0.6.0-alpha";
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -89,9 +90,9 @@ impl CompressionMode {
         match self {
             CompressionMode::Store => "No compression; instant archiving and indexing",
             CompressionMode::Fast => "LZ4 hardware-accelerated pipeline prioritizing speed",
-            CompressionMode::Balanced => "Zstandard + content classification balancing speed and ratio",
-            CompressionMode::Maximum => "High-level Zstandard with BCJ, Delta, and Byte-Shuffle filters",
-            CompressionMode::Ultra => "Maximum density LZMA2/Brotli with FastCDC global deduplication",
+            CompressionMode::Balanced => "Adaptive LZ4/Zlib + content classification balancing speed and ratio",
+            CompressionMode::Maximum => "High-level Deflate/Zlib with BCJ, Delta, and Byte-Shuffle filters",
+            CompressionMode::Ultra => "Maximum density Brotli-Ultra with Seed Dictionary & FastCDC deduplication",
             CompressionMode::Automatic => "Per-block dynamic routing via Shannon entropy and magic bytes",
         }
     }

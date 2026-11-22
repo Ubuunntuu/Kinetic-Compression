@@ -8,6 +8,7 @@ use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::classifier::classify_content;
 use crate::memory::MemoryArena;
 use crate::progress::JobController;
 use crate::{CompressionMode, EngineError};
@@ -18,6 +19,7 @@ pub enum BlockCodec {
     Store = 0x00,
     Lz4 = 0x01,
     DeflateHigh = 0x02,
+    BrotliUltra = 0x04,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,12 +72,14 @@ pub fn estimate_shannon_entropy(data: &[u8]) -> f64 {
 fn compress_single_block(
     block_id: u32,
     raw: &[u8],
+    label: &str,
     mode: CompressionMode,
     enable_entropy_bypass: bool,
 ) -> Result<CompressedBlock, EngineError> {
     let uncompressed_size = raw.len() as u64;
     let xxh3_checksum = xxh3_64(raw);
-    let shannon_entropy = estimate_shannon_entropy(raw);
+    let profile = classify_content(label, raw);
+    let shannon_entropy = profile.shannon_entropy;
 
     let target_codec = match mode {
         CompressionMode::Store => BlockCodec::Store,
@@ -89,26 +93,27 @@ fn compress_single_block(
         CompressionMode::Balanced => {
             if enable_entropy_bypass && shannon_entropy > 7.85 {
                 BlockCodec::Store
+            } else if shannon_entropy <= 5.0 {
+                BlockCodec::DeflateHigh
             } else {
                 BlockCodec::Lz4
             }
         }
-        CompressionMode::Maximum | CompressionMode::Ultra => {
-            if enable_entropy_bypass && shannon_entropy > 7.92 {
+        CompressionMode::Maximum => {
+            if enable_entropy_bypass && shannon_entropy > 7.90 {
                 BlockCodec::Store
             } else {
                 BlockCodec::DeflateHigh
             }
         }
-        CompressionMode::Automatic => {
-            if shannon_entropy > 7.85 {
+        CompressionMode::Ultra => {
+            if enable_entropy_bypass && shannon_entropy > 7.95 {
                 BlockCodec::Store
-            } else if shannon_entropy > 5.8 {
-                BlockCodec::Lz4
             } else {
-                BlockCodec::DeflateHigh
+                BlockCodec::BrotliUltra
             }
         }
+        CompressionMode::Automatic => profile.recommended_codec,
     };
 
     let (final_codec, payload) = match target_codec {
@@ -122,7 +127,7 @@ fn compress_single_block(
             }
         }
         BlockCodec::DeflateHigh => {
-            let level = if mode == CompressionMode::Ultra {
+            let level = if mode == CompressionMode::Maximum {
                 Compression::best()
             } else {
                 Compression::new(6)
@@ -134,6 +139,19 @@ fn compress_single_block(
                 (BlockCodec::Store, raw.to_vec())
             } else {
                 (BlockCodec::DeflateHigh, comp)
+            }
+        }
+        BlockCodec::BrotliUltra => {
+            let mut comp = Vec::with_capacity(raw.len() / 2);
+            {
+                let mut writer = brotli::CompressorWriter::new(&mut comp, 4096, 9, 20);
+                writer.write_all(raw)?;
+                writer.flush()?;
+            }
+            if comp.len() >= raw.len() {
+                (BlockCodec::Store, raw.to_vec())
+            } else {
+                (BlockCodec::BrotliUltra, comp)
             }
         }
     };
@@ -157,6 +175,12 @@ pub fn decompress_single_block(block: &CompressedBlock) -> Result<Vec<u8>, Engin
             .map_err(|e| EngineError::UnsupportedOperation(format!("LZ4 decode error: {}", e)))?,
         BlockCodec::DeflateHigh => {
             let mut dec = ZlibDecoder::new(&block.payload[..]);
+            let mut out = Vec::with_capacity(block.uncompressed_size as usize);
+            dec.read_to_end(&mut out)?;
+            out
+        }
+        BlockCodec::BrotliUltra => {
+            let mut dec = brotli::Decompressor::new(&block.payload[..], 4096);
             let mut out = Vec::with_capacity(block.uncompressed_size as usize);
             dec.read_to_end(&mut out)?;
             out
@@ -200,13 +224,20 @@ pub fn compress_stream_parallel(
         let rx = work_rx.clone();
         let tx = res_tx.clone();
         let ctrl = Arc::clone(controller);
+        let label_owned = label.to_string();
         handles.push(thread::spawn(move || {
             while let Ok((block_id, arena_buf)) = rx.recv() {
                 if let Err(cancel_msg) = ctrl.check_point() {
                     let _ = tx.send(Err(cancel_msg));
                     break;
                 }
-                match compress_single_block(block_id, &arena_buf.data, mode, enable_entropy_bypass) {
+                match compress_single_block(
+                    block_id,
+                    &arena_buf.data,
+                    &label_owned,
+                    mode,
+                    enable_entropy_bypass,
+                ) {
                     Ok(block) => {
                         ctrl.record_block_progress(block.uncompressed_size, block.compressed_size);
                         if tx.send(Ok(block)).is_err() {
@@ -374,28 +405,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_multithreaded_pipeline_roundtrip_and_integrity() {
+    fn test_all_six_compression_modes_roundtrip() {
         let arena = MemoryArena::new(128);
         let controller = Arc::new(JobController::new());
-        let sample = b"Kinetic Engine Phase 4 Multithreaded Pipeline Verification Data! ".repeat(8192);
+        let sample = b"Kinetic Engine Phase 6 All-Mode Verification Stream (Store, Fast, Balanced, Maximum, Ultra, Automatic)! ".repeat(1024);
 
-        let (blocks, report) = compress_stream_parallel(
-            &sample,
-            "verification_corpus.bin",
+        let modes = [
+            CompressionMode::Store,
+            CompressionMode::Fast,
             CompressionMode::Balanced,
-            4,
-            true,
-            &arena,
-            &controller,
-        )
-        .unwrap();
+            CompressionMode::Maximum,
+            CompressionMode::Ultra,
+            CompressionMode::Automatic,
+        ];
 
-        assert!(blocks.len() >= 1);
-        assert_eq!(report.total_uncompressed_bytes, sample.len() as u64);
-        assert!(report.total_compressed_bytes < report.total_uncompressed_bytes);
+        for mode in modes {
+            let (blocks, report) = compress_stream_parallel(
+                &sample,
+                "source_code.rs",
+                mode,
+                4,
+                true,
+                &arena,
+                &controller,
+            )
+            .unwrap();
 
-        let restored = decompress_blocks_parallel(&blocks, 4, &controller).unwrap();
-        assert_eq!(restored, sample);
+            assert_eq!(report.total_uncompressed_bytes, sample.len() as u64);
+            if mode != CompressionMode::Store {
+                assert!(report.total_compressed_bytes < report.total_uncompressed_bytes);
+            }
+
+            let restored = decompress_blocks_parallel(&blocks, 4, &controller).unwrap();
+            assert_eq!(restored, sample);
+        }
     }
 
     #[test]
@@ -407,7 +450,7 @@ mod tests {
         let (mut blocks, _) = compress_stream_parallel(
             &sample,
             "integrity.bin",
-            CompressionMode::Fast,
+            CompressionMode::Ultra,
             2,
             true,
             &arena,

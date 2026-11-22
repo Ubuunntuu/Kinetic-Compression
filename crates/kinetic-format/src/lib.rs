@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod cdc;
 pub mod crypto;
+pub mod dictionary;
 pub mod filters;
 
 use serde::{Deserialize, Serialize};
