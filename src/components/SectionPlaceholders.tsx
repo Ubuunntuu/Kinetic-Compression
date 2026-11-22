@@ -1,10 +1,10 @@
+import { BenchmarkCenter } from "./BenchmarkCenter";
 import React, { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   FilePlus2,
   FolderOutput,
   Activity,
-  Gauge,
   ShieldCheck,
   Play,
   Pause,
@@ -950,19 +950,5 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
     );
   }
 
-  return (
-    <div className="card">
-      <div className="card-header">
-        <span className="card-title">
-          <Gauge size={16} /> Reproducible Benchmark Center (vs. 7-Zip &amp;
-          WinRAR)
-        </span>
-        <span className="badge badge-accent">No Fabricated Metrics</span>
-      </div>
-      <div className="empty-state">
-        Automated comparative benchmark harness against local 7-Zip and WinRAR
-        binaries connects in <strong>Phase 9</strong>.
-      </div>
-    </div>
-  );
+  return <BenchmarkCenter status={status} />;
 };

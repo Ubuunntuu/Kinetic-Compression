@@ -13,6 +13,7 @@ serde.workspace = true
 thiserror.workspace = true
 crc32fast.workspace = true
 walkdir.workspace = true
+crossbeam-channel.workspace = true
 zip.workspace = true
 sevenz-rust.workspace = true
 blake3.workspace = true

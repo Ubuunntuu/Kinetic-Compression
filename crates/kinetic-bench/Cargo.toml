@@ -3,8 +3,20 @@ name = "kinetic-bench"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "kinetic_bench"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "kinetic-bench"
+path = "src/main.rs"
+
 [dependencies]
 kinetic-core = { path = "../kinetic-core" }
 kinetic-format = { path = "../kinetic-format" }
 kinetic-compat = { path = "../kinetic-compat" }
+serde.workspace = true
 serde_json.workspace = true
+sysinfo.workspace = true
+blake3.workspace = true

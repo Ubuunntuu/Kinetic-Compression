@@ -188,3 +188,36 @@ export interface EngineStatusPayload {
   supported_formats: FormatCapability[];
   compression_modes: ModeCapability[];
 }
+export interface BenchmarkEntryResult {
+  dataset_name: string;
+  engine_label: string;
+  original_bytes: number;
+  compressed_bytes: number;
+  compression_ratio_percent: number;
+  compress_ms: number;
+  extract_ms: number;
+  compress_mb_s: number;
+  extract_mb_s: number;
+  peak_memory_mb: number;
+  cpu_utilization_percent: number;
+  verified_lossless: boolean;
+}
+
+export interface ThreadScalingPoint {
+  threads: number;
+  compress_mb_s: number;
+  extract_mb_s: number;
+  duration_ms: number;
+  speedup_factor: number;
+}
+
+export interface BenchmarkSuiteReport {
+  timestamp_utc: string;
+  engine_version: string;
+  hardware: HardwareProfile;
+  seven_zip_detected: string | null;
+  winrar_detected: string | null;
+  results: BenchmarkEntryResult[];
+  thread_scaling: ThreadScalingPoint[];
+  markdown_report_path: string;
+}

@@ -699,6 +699,14 @@ pub fn run_engine_pipeline_job_cmd(
     Ok(report)
 }
 
+
+#[tauri::command]
+pub fn run_benchmark_suite_cmd(
+    scale_mb: Option<usize>,
+) -> Result<kinetic_bench::BenchmarkSuiteReport, String> {
+    let root = PathBuf::from(r"C:\projects\kinetic compression");
+    kinetic_bench::run_full_benchmark_suite(&root, scale_mb.unwrap_or(4))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,3 +1,5 @@
+use std::thread;
+use crossbeam_channel::{bounded, unbounded};
 pub mod rar_provider;
 pub mod security;
 pub mod sevenz_provider;
@@ -602,11 +604,19 @@ pub fn extract_selected_entries(
                 }
             }
 
-            let mut f = File::open(archive_path)?;
+            let target_descs: Vec<_> = index
+                .blocks
+                .iter()
+                .filter(|d| needed_blocks.contains(&d.block_id))
+                .cloned()
+                .collect();
+
             let mut block_cache: HashMap<u32, Vec<u8>> =
-                HashMap::with_capacity(needed_blocks.len());
-            for desc in &index.blocks {
-                if needed_blocks.contains(&desc.block_id) {
+                HashMap::with_capacity(target_descs.len());
+
+            if target_descs.len() <= 2 {
+                let mut f = File::open(archive_path)?;
+                for desc in &target_descs {
                     let raw = read_and_verify_block(
                         &mut f,
                         desc,
@@ -617,6 +627,79 @@ pub fn extract_selected_entries(
                     )
                     .map_err(|e| CompatError::Format(e.to_string()))?;
                     block_cache.insert(desc.block_id, raw);
+                }
+            } else {
+                let threads = std::thread::available_parallelism()
+                    .map(|n| n.get().saturating_sub(1).max(1))
+                    .unwrap_or(4)
+                    .min(target_descs.len());
+                let (work_tx, work_rx) = bounded::<kinetic_format::archive::BlockDescriptor>(threads * 2);
+                let (res_tx, res_rx) = unbounded::<Result<(u32, Vec<u8>), String>>();
+
+                let mut handles = Vec::with_capacity(threads);
+                for _ in 0..threads {
+                    let rx = work_rx.clone();
+                    let tx = res_tx.clone();
+                    let path_clone = archive_path.to_path_buf();
+                    let all_blocks = index.blocks.clone();
+                    let p_off = index.parity_offset;
+                    let p_len = index.parity_length;
+                    let key_clone = crypto_key;
+
+                    handles.push(thread::spawn(move || {
+                        let mut f = match File::open(&path_clone) {
+                            Ok(file) => file,
+                            Err(e) => {
+                                let _ = tx.send(Err(e.to_string()));
+                                return;
+                            }
+                        };
+                        while let Ok(desc) = rx.recv() {
+                            match read_and_verify_block(
+                                &mut f,
+                                &desc,
+                                &all_blocks,
+                                p_off,
+                                p_len,
+                                key_clone.as_ref(),
+                            ) {
+                                Ok(raw) => {
+                                    let _ = tx.send(Ok((desc.block_id, raw)));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(e.to_string()));
+                                    break;
+                                }
+                            }
+                        }
+                    }));
+                }
+                drop(work_rx);
+                drop(res_tx);
+
+                for d in target_descs {
+                    let _ = work_tx.send(d);
+                }
+                drop(work_tx);
+
+                let mut first_err = None;
+                for res in res_rx {
+                    match res {
+                        Ok((bid, raw)) => {
+                            block_cache.insert(bid, raw);
+                        }
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                }
+                for h in handles {
+                    let _ = h.join();
+                }
+                if let Some(err_msg) = first_err {
+                    return Err(CompatError::Format(err_msg));
                 }
             }
 
