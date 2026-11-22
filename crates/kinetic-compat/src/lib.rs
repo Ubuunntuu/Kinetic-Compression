@@ -1,4 +1,4 @@
-﻿use std::path::Path;
+use std::path::Path;
 use kinetic_core::ArchiveFormat;
 use kinetic_format::KINETIC_MAGIC;
 use serde::{Deserialize, Serialize};

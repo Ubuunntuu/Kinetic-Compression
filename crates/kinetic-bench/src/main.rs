@@ -1,4 +1,4 @@
-﻿use std::path::Path;
+use std::path::Path;
 use kinetic_core::{ArchiveFormat, CompressionMode, HardwareProfile, ENGINE_NAME, ENGINE_VERSION};
 
 fn find_external_tool(candidates: &[&str]) -> Option<String> {

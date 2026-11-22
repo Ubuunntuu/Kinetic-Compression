@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const KINETIC_MAGIC: [u8; 8] = *b"KNT1\r\n\x1a\n";

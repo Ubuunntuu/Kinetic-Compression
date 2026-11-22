@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "kinetic-bench"
 version.workspace = true
 edition.workspace = true

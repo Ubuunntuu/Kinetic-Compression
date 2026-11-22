@@ -1,4 +1,4 @@
-﻿# KINETIC ARCHIVE FORMAT SPECIFICATION (.kinetic) — Version 1.0
+# KINETIC ARCHIVE FORMAT SPECIFICATION (.kinetic) — Version 1.0
 
 ## 1. Overview
 The .kinetic format is a high-performance, random-access, block-multiplexed archive format designed for the Kinetic Engine.

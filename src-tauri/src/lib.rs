@@ -1,4 +1,4 @@
-﻿pub mod commands;
+pub mod commands;
 pub mod state;
 
 use commands::get_engine_status;

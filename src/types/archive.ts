@@ -1,4 +1,4 @@
-﻿export type ArchiveFormat = "Zip" | "Kinetic" | "SevenZ" | "Rar";
+export type ArchiveFormat = "Zip" | "Kinetic" | "SevenZ" | "Rar";
 
 export type CompressionMode =
   | "Store"

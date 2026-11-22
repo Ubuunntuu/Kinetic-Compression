@@ -1,4 +1,4 @@
-﻿use kinetic_core::{
+use kinetic_core::{
     ArchiveFormat, CompressionMode, HardwareProfile, ENGINE_NAME, ENGINE_VERSION,
 };
 use serde::{Deserialize, Serialize};
