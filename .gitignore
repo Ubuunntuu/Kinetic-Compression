@@ -1,28 +1,19 @@
-# Rust / Cargo
-/target/
+﻿/target/
 **/target/
 **/*.rs.bk
 Cargo.lock
-
-# Node / Frontend
 /node_modules/
 /dist/
 /dist-ssr/
 *.local
-
-# Tauri
 /src-tauri/target/
 /src-tauri/WixTools/
 /src-tauri/gen/
-
-# Benchmark Artifacts & Temp Archives
 /bench_data/
 /bench_output/
 *.kinetic.part
 *.zip.part
 *.7z.part
-
-# IDE & OS
 .vscode/
 .idea/
 Thumbs.db
