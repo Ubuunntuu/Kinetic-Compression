@@ -3,6 +3,9 @@ name = "kinetic-compat"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 kinetic-core = { path = "../kinetic-core" }
 kinetic-format = { path = "../kinetic-format" }

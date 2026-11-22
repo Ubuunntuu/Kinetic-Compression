@@ -3,6 +3,9 @@ name = "kinetic-format"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 kinetic-core = { path = "../kinetic-core" }
 serde.workspace = true

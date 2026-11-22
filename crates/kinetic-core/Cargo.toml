@@ -3,6 +3,9 @@ name = "kinetic-core"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

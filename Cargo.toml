@@ -5,6 +5,7 @@ members = [
     "crates/kinetic-format",
     "crates/kinetic-compat",
     "crates/kinetic-bench",
+    "src-tauri",
 ]
 
 [workspace.package]
