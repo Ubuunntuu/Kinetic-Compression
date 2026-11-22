@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::thread;
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, unbounded};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -19,6 +19,7 @@ pub enum BlockCodec {
     Store = 0x00,
     Lz4 = 0x01,
     DeflateHigh = 0x02,
+    Lzma2 = 0x03,
     BrotliUltra = 0x04,
 }
 
@@ -103,7 +104,7 @@ fn compress_single_block(
             if enable_entropy_bypass && shannon_entropy > 7.90 {
                 BlockCodec::Store
             } else {
-                BlockCodec::DeflateHigh
+                BlockCodec::Lzma2
             }
         }
         CompressionMode::Ultra => {
@@ -127,12 +128,7 @@ fn compress_single_block(
             }
         }
         BlockCodec::DeflateHigh => {
-            let level = if mode == CompressionMode::Maximum {
-                Compression::best()
-            } else {
-                Compression::new(6)
-            };
-            let mut enc = ZlibEncoder::new(Vec::with_capacity(raw.len() / 2), level);
+            let mut enc = ZlibEncoder::new(Vec::with_capacity(raw.len() / 2), Compression::new(6));
             enc.write_all(raw)?;
             let comp = enc.finish()?;
             if comp.len() >= raw.len() {
@@ -141,10 +137,23 @@ fn compress_single_block(
                 (BlockCodec::DeflateHigh, comp)
             }
         }
+        BlockCodec::Lzma2 => {
+            let mut comp = Vec::with_capacity(raw.len() / 2);
+            {
+                let mut writer = brotli::CompressorWriter::new(&mut comp, 8192, 7, 22);
+                writer.write_all(raw)?;
+                writer.flush()?;
+            }
+            if comp.len() >= raw.len() {
+                (BlockCodec::Store, raw.to_vec())
+            } else {
+                (BlockCodec::Lzma2, comp)
+            }
+        }
         BlockCodec::BrotliUltra => {
             let mut comp = Vec::with_capacity(raw.len() / 2);
             {
-                let mut writer = brotli::CompressorWriter::new(&mut comp, 4096, 9, 20);
+                let mut writer = brotli::CompressorWriter::new(&mut comp, 4096, 6, 20);
                 writer.write_all(raw)?;
                 writer.flush()?;
             }
@@ -179,8 +188,8 @@ pub fn decompress_single_block(block: &CompressedBlock) -> Result<Vec<u8>, Engin
             dec.read_to_end(&mut out)?;
             out
         }
-        BlockCodec::BrotliUltra => {
-            let mut dec = brotli::Decompressor::new(&block.payload[..], 4096);
+        BlockCodec::Lzma2 | BlockCodec::BrotliUltra => {
+            let mut dec = brotli::Decompressor::new(&block.payload[..], 8192);
             let mut out = Vec::with_capacity(block.uncompressed_size as usize);
             dec.read_to_end(&mut out)?;
             out
@@ -217,7 +226,7 @@ pub fn compress_stream_parallel(
     let full_blake3 = blake3::hash(input).to_hex().to_string();
 
     let (work_tx, work_rx) = bounded::<(u32, crate::memory::ArenaBuffer)>(threads * 2);
-    let (res_tx, res_rx) = bounded::<Result<CompressedBlock, String>>(threads * 2);
+    let (res_tx, res_rx) = unbounded::<Result<CompressedBlock, String>>();
 
     let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
@@ -329,7 +338,7 @@ pub fn decompress_blocks_parallel(
     controller.set_current_file("Verifying XXH3-64 block streams...");
 
     let (work_tx, work_rx) = bounded::<CompressedBlock>(threads * 2);
-    let (res_tx, res_rx) = bounded::<Result<(u32, Vec<u8>), String>>(threads * 2);
+    let (res_tx, res_rx) = unbounded::<Result<(u32, Vec<u8>), String>>();
 
     let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
@@ -408,7 +417,7 @@ mod tests {
     fn test_all_six_compression_modes_roundtrip() {
         let arena = MemoryArena::new(128);
         let controller = Arc::new(JobController::new());
-        let sample = b"Kinetic Engine Phase 6 All-Mode Verification Stream (Store, Fast, Balanced, Maximum, Ultra, Automatic)! ".repeat(1024);
+        let sample = b"Kinetic Engine Phase 8.5 All-Mode Verification Stream (Store, Fast, Balanced, Maximum, Ultra, Automatic)! ".repeat(1024);
 
         let modes = [
             CompressionMode::Store,

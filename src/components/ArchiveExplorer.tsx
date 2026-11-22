@@ -17,6 +17,7 @@ import {
 import {
   ArchiveEntry,
   ArchiveInspection,
+  EntryPreview,
   IntegrityReport,
   OperationResult,
 } from "../types/archive";
@@ -41,6 +42,8 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
   const [extractResult, setExtractResult] = useState<OperationResult | null>(
     null
   );
+  const [previewData, setPreviewData] = useState<EntryPreview | null>(null);
+  const [previewMode, setPreviewMode] = useState<"text" | "hex">("text");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<boolean>(false);
 
@@ -89,6 +92,47 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
     }
   };
 
+  const handlePreviewEntry = async (entryPath: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await invoke<EntryPreview>("preview_entry_cmd", {
+        archivePath,
+        entryPath,
+        password: password.trim().length > 0 ? password : null,
+      });
+      setPreviewData(res);
+      setPreviewMode(res.is_text ? "text" : "hex");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDeleteEntry = async (entryPath: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const msg = await invoke<string>("delete_entry_cmd", {
+        archivePath,
+        entryPath,
+        password: password.trim().length > 0 ? password : null,
+      });
+      setValidation({
+        valid: true,
+        verified_entries: 0,
+        total_uncompressed_bytes: 0,
+        message: msg,
+      });
+      await loadArchive();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleSecurityAudit = async () => {
     setBusy(true);
     setError(null);
@@ -120,6 +164,7 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
       setBusy(false);
     }
   };
+
   const handleValidate = async () => {
     setBusy(true);
     setError(null);
@@ -259,8 +304,8 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
     <div className="card">
       <div className="card-header">
         <span className="card-title">
-          <FolderTree size={16} /> Archive Explorer (Browse, Search, Sort,
-          Multi-Select &amp; Context Actions)
+          <FolderTree size={16} /> Archive Explorer (Browse, Preview, Modify,
+          Audit &amp; Repair)
         </span>
         {inspection && (
           <span className="badge badge-accent">
@@ -270,7 +315,6 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
         )}
       </div>
 
-      {/* Drag & Drop Archive Dropzone */}
       <div
         className={`dropzone ${dragActive ? "drag-active" : ""}`}
         onDragOver={(e) => {
@@ -298,19 +342,19 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
         </div>
       </div>
 
-      {/* Path & Action Toolbar */}
       <div
         style={{
           display: "flex",
           gap: "10px",
           marginBottom: "14px",
           alignItems: "center",
+          flexWrap: "wrap",
         }}
       >
         <input
           type="text"
           className="form-input"
-          style={{ flex: 2 }}
+          style={{ flex: 2, minWidth: "240px" }}
           placeholder="Archive file path..."
           value={archivePath}
           onChange={(e) => setArchivePath(e.target.value)}
@@ -318,7 +362,7 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
         <input
           type="password"
           className="form-input"
-          style={{ flex: 1 }}
+          style={{ flex: 1, minWidth: "160px" }}
           placeholder="AES-256-GCM Password (optional)"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
@@ -330,7 +374,13 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
         >
           <Search size={15} /> Open Archive
         </button>
-        <button className="btn" onClick={handleSecurityAudit} disabled={busy}>Security Audit</button><button className="btn" onClick={handleRepairArchive} disabled={busy}>Repair (.kinetic)</button><button className="btn" onClick={handleValidate} disabled={busy}>
+        <button className="btn" onClick={handleSecurityAudit} disabled={busy}>
+          Security Audit
+        </button>
+        <button className="btn" onClick={handleRepairArchive} disabled={busy}>
+          Repair (.kinetic)
+        </button>
+        <button className="btn" onClick={handleValidate} disabled={busy}>
           <ShieldCheck size={15} /> Verify Integrity
         </button>
       </div>
@@ -349,7 +399,7 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
           className="card"
           style={{ marginBottom: "14px", borderColor: "var(--status-success)" }}
         >
-          <strong>Integrity Verification Passed:</strong> {validation.message}
+          <strong>Operation Report:</strong> {validation.message}
         </div>
       )}
 
@@ -363,9 +413,66 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
         </div>
       )}
 
+      {previewData && (
+        <div
+          className="card"
+          style={{
+            marginBottom: "16px",
+            borderColor: "var(--accent-primary)",
+            backgroundColor: "var(--bg-elevated)",
+          }}
+        >
+          <div className="card-header">
+            <span className="card-title">
+              <FileText size={15} /> In-Memory Inspector: {previewData.path} (
+              {previewData.codec_name} • {previewData.size_bytes} bytes)
+            </span>
+            <div style={{ display: "flex", gap: "8px" }}>
+              <button
+                className={`btn ${previewMode === "text" ? "btn-primary" : ""}`}
+                onClick={() => setPreviewMode("text")}
+                style={{ padding: "4px 10px", fontSize: "12px" }}
+              >
+                UTF-8 Text / Code
+              </button>
+              <button
+                className={`btn ${previewMode === "hex" ? "btn-primary" : ""}`}
+                onClick={() => setPreviewMode("hex")}
+                style={{ padding: "4px 10px", fontSize: "12px" }}
+              >
+                Hex + ASCII Dump
+              </button>
+              <button
+                className="btn"
+                onClick={() => setPreviewData(null)}
+                style={{ padding: "4px 10px", fontSize: "12px" }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+          <pre
+            style={{
+              maxHeight: "240px",
+              overflowY: "auto",
+              padding: "12px",
+              backgroundColor: "var(--bg-base)",
+              borderRadius: "6px",
+              fontFamily: "Consolas, monospace",
+              fontSize: "12px",
+              whiteSpace: "pre-wrap",
+              userSelect: "text",
+            }}
+          >
+            {previewMode === "text"
+              ? previewData.text_preview
+              : previewData.hex_preview}
+          </pre>
+        </div>
+      )}
+
       {inspection && (
         <>
-          {/* Breadcrumb Navigation & Filter Bar */}
           <div className="breadcrumb-bar">
             <button
               className={`breadcrumb-btn ${currentFolder === "" ? "active" : ""}`}
@@ -400,7 +507,6 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
             </div>
           </div>
 
-          {/* Search & Multi-Selection Extraction Toolbar */}
           <div
             style={{
               display: "flex",
@@ -553,12 +659,12 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
                     <td>{getFileType(entry)}</td>
                     <td>
                       {entry.is_dir
-                        ? "—"
+                        ? "-"
                         : `${(entry.uncompressed_size / 1024).toFixed(2)} KB`}
                     </td>
                     <td>
                       {entry.is_dir
-                        ? "—"
+                        ? "-"
                         : `${(entry.compressed_size / 1024).toFixed(2)} KB`}
                     </td>
                     <td>{entry.codec_name}</td>
@@ -573,7 +679,6 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
         </>
       )}
 
-      {/* Custom Right-Click Context Menu */}
       {contextMenu && (
         <div
           className="context-menu"
@@ -583,7 +688,22 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
             className="context-item"
             onClick={() => handleExtractSelected([contextMenu.entry.path])}
           >
-            <Download size={14} /> Extract "{contextMenu.entry.path.split("/").pop()}"
+            <Download size={14} /> Extract "
+            {contextMenu.entry.path.split("/").pop()}"
+          </button>
+          {!contextMenu.entry.is_dir && (
+            <button
+              className="context-item"
+              onClick={() => handlePreviewEntry(contextMenu.entry.path)}
+            >
+              <FileText size={14} /> Preview in Memory (Text / Hex)
+            </button>
+          )}
+          <button
+            className="context-item"
+            onClick={() => handleDeleteEntry(contextMenu.entry.path)}
+          >
+            <Square size={14} /> Delete Entry (Zero-Recompression .kinetic)
           </button>
           <button className="context-item" onClick={handleValidate}>
             <ShieldCheck size={14} /> Verify Archive Integrity

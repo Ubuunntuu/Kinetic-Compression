@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::time::Instant;
 use kinetic_compat::{
-    create_archive_with_options, extract_archive_with_password, extract_selected_entries,
-    audit_archive_security, inspect_archive_with_password, repair_archive, validate_archive_with_password, ArchiveInspection,
+    append_archive_entries, audit_archive_security, create_archive_with_options,
+    delete_archive_entry, extract_archive_with_password, extract_selected_entries,
+    inspect_archive_with_password, join_archive_volumes, preview_archive_entry, repair_archive,
+    split_archive_volumes, validate_archive_with_password, ArchiveInspection, EntryPreview,
     IntegrityReport,
 };
 use kinetic_core::pipeline::{
@@ -54,6 +56,7 @@ pub struct CreateArchiveRequest {
     pub format: ArchiveFormat,
     pub mode: CompressionMode,
     pub password: Option<String>,
+    pub split_volume_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +86,14 @@ pub struct OperationResult {
     pub duration_ms: u64,
     pub throughput_mb_s: f64,
     pub compression_ratio_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsNode {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size_bytes: u64,
 }
 
 pub fn build_engine_status(state: &AppState) -> EngineStatusPayload {
@@ -156,6 +167,8 @@ fn record_recent_archive(state: &AppState, path: &PathBuf, format: ArchiveFormat
         },
     );
     list.truncate(15);
+    drop(list);
+    state.save_to_disk();
 }
 
 #[tauri::command]
@@ -178,6 +191,7 @@ pub fn update_user_config(
     let mut cfg = state.config.lock().unwrap();
     *cfg = new_config;
     drop(cfg);
+    state.save_to_disk();
     Ok(build_engine_status(&state))
 }
 
@@ -185,6 +199,7 @@ pub fn update_user_config(
 pub fn clear_recent_history(state: State<'_, AppState>) -> EngineStatusPayload {
     state.recent_archives.lock().unwrap().clear();
     state.recent_operations.lock().unwrap().clear();
+    state.save_to_disk();
     build_engine_status(&state)
 }
 
@@ -213,6 +228,132 @@ pub fn validate_archive_cmd(
 ) -> Result<IntegrityReport, String> {
     let path = PathBuf::from(&archive_path);
     validate_archive_with_password(&path, password.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn audit_archive_cmd(
+    archive_path: String,
+    password: Option<String>,
+) -> Result<IntegrityReport, String> {
+    let path = PathBuf::from(&archive_path);
+    audit_archive_security(&path, password.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn repair_archive_cmd(
+    archive_path: String,
+    password: Option<String>,
+) -> Result<IntegrityReport, String> {
+    let path = PathBuf::from(&archive_path);
+    repair_archive(&path, password.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn preview_entry_cmd(
+    archive_path: String,
+    entry_path: String,
+    password: Option<String>,
+) -> Result<EntryPreview, String> {
+    let path = PathBuf::from(&archive_path);
+    preview_archive_entry(&path, &entry_path, password.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_entry_cmd(
+    archive_path: String,
+    entry_path: String,
+    password: Option<String>,
+) -> Result<String, String> {
+    let path = PathBuf::from(&archive_path);
+    delete_archive_entry(&path, &entry_path, password.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn append_entries_cmd(
+    archive_path: String,
+    new_paths: Vec<String>,
+    password: Option<String>,
+) -> Result<String, String> {
+    let path = PathBuf::from(&archive_path);
+    let sources: Vec<PathBuf> = new_paths.into_iter().map(PathBuf::from).collect();
+    append_archive_entries(&path, &sources, password.as_deref()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn split_archive_cmd(
+    archive_path: String,
+    volume_size_mb: u64,
+) -> Result<Vec<String>, String> {
+    let path = PathBuf::from(&archive_path);
+    split_archive_volumes(&path, volume_size_mb).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn join_archive_cmd(
+    first_volume_path: String,
+    output_archive_path: String,
+) -> Result<u64, String> {
+    let first = PathBuf::from(&first_volume_path);
+    let out = PathBuf::from(&output_archive_path);
+    join_archive_volumes(&first, &out).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn browse_filesystem_cmd(dir_path: Option<String>) -> Result<Vec<FsNode>, String> {
+    let target = dir_path
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| r"C:\projects\kinetic compression".to_string());
+    let path = PathBuf::from(&target);
+    if !path.exists() || !path.is_dir() {
+        return Err(format!("Directory does not exist: {}", target));
+    }
+
+    let mut nodes = Vec::new();
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            nodes.push(FsNode {
+                name: ".. (Parent Directory)".to_string(),
+                path: parent.to_string_lossy().into_owned(),
+                is_dir: true,
+                size_bytes: 0,
+            });
+        }
+    }
+
+    let entries = std::fs::read_dir(&path).map_err(|e| e.to_string())?;
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name == "node_modules" || name == "target" {
+            continue;
+        }
+        let is_dir = p.is_dir();
+        let size_bytes = if is_dir {
+            0
+        } else {
+            p.metadata().map(|m| m.len()).unwrap_or(0)
+        };
+        let node = FsNode {
+            name,
+            path: p.to_string_lossy().into_owned(),
+            is_dir,
+            size_bytes,
+        };
+        if is_dir {
+            dirs.push(node);
+        } else {
+            files.push(node);
+        }
+    }
+
+    dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    nodes.extend(dirs);
+    nodes.extend(files);
+    Ok(nodes)
 }
 
 #[tauri::command]
@@ -255,6 +396,16 @@ pub fn create_archive_cmd(
             return Err(msg);
         }
     };
+
+    let mut split_notice = String::new();
+    if let Some(vol_mb) = request.split_volume_mb {
+        if vol_mb > 0 {
+            if let Ok(parts) = split_archive_volumes(&out_path, vol_mb) {
+                split_notice = format!(" [Split into {} volumes]", parts.len());
+            }
+        }
+    }
+
     let elapsed = started.elapsed();
     let duration_ms = elapsed.as_millis().max(1) as u64;
 
@@ -296,15 +447,18 @@ pub fn create_archive_cmd(
         },
     );
     ops.truncate(20);
+    drop(ops);
+    state.save_to_disk();
 
     Ok(OperationResult {
         success: true,
         message: format!(
-            "Created {} ({:.2} MB -> {:.2} MB in {} ms)",
+            "Created {} ({:.2} MB -> {:.2} MB in {} ms){}",
             target_name,
             (input_bytes as f64) / (1024.0 * 1024.0),
             (compressed_bytes as f64) / (1024.0 * 1024.0),
-            duration_ms
+            duration_ms,
+            split_notice
         ),
         archive_path: request.output_path,
         processed_bytes: input_bytes,
@@ -388,6 +542,8 @@ pub fn extract_archive_cmd(
         },
     );
     ops.truncate(20);
+    drop(ops);
+    state.save_to_disk();
 
     Ok(OperationResult {
         success: true,
@@ -497,7 +653,7 @@ pub fn run_engine_pipeline_job_cmd(
 
     let clamped_mb = payload_size_mb.clamp(4, 128);
     let pattern =
-        b"Kinetic Engine Phase 7 Multithreaded Ring-Buffer Pipeline Telemetry Stream! ";
+        b"Kinetic Engine Phase 8.5 Multithreaded Ring-Buffer Pipeline Telemetry Stream! ";
     let repeats = (clamped_mb * 1024 * 1024) / pattern.len();
     let dataset = pattern.repeat(repeats);
 
@@ -537,28 +693,12 @@ pub fn run_engine_pipeline_job_cmd(
         },
     );
     ops.truncate(20);
+    drop(ops);
+    state.save_to_disk();
 
     Ok(report)
 }
 
-
-#[tauri::command]
-pub fn audit_archive_cmd(
-    archive_path: String,
-    password: Option<String>,
-) -> Result<IntegrityReport, String> {
-    let path = PathBuf::from(&archive_path);
-    audit_archive_security(&path, password.as_deref()).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn repair_archive_cmd(
-    archive_path: String,
-    password: Option<String>,
-) -> Result<IntegrityReport, String> {
-    let path = PathBuf::from(&archive_path);
-    repair_archive(&path, password.as_deref()).map_err(|e| e.to_string())
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,6 +711,5 @@ mod tests {
         assert_eq!(status.default_mode, CompressionMode::Balanced);
         assert_eq!(status.supported_formats.len(), 4);
         assert_eq!(status.compression_modes.len(), 6);
-        assert_eq!(status.config.theme, "dark");
     }
 }

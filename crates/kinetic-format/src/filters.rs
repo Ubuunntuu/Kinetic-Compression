@@ -1,15 +1,29 @@
 pub const FILTER_NONE: u8 = 0x00;
 pub const FILTER_X86_BCJ: u8 = 0x01;
+pub const FILTER_ARM64_BCJ: u8 = 0x02;
 pub const FILTER_BYTE_DELTA: u8 = 0x04;
 pub const FILTER_BYTE_SHUFFLE: u8 = 0x08;
+pub const FILTER_CONTAINER_REPACK: u8 = 0x10;
 
 pub fn select_optimal_filter(file_path: &str, data: &[u8]) -> u8 {
     let lower = file_path.to_ascii_lowercase();
+    if lower.ends_with(".arm64") || lower.ends_with(".aarch64") || lower.ends_with(".so") {
+        return FILTER_ARM64_BCJ;
+    }
     if (data.len() >= 2 && &data[0..2] == b"MZ")
         || lower.ends_with(".exe")
         || lower.ends_with(".dll")
     {
         return FILTER_X86_BCJ;
+    }
+    if (data.len() >= 4 && &data[0..4] == b"PK\x03\x04")
+        && (lower.ends_with(".docx")
+            || lower.ends_with(".xlsx")
+            || lower.ends_with(".pptx")
+            || lower.ends_with(".jar")
+            || lower.ends_with(".apk"))
+    {
+        return FILTER_CONTAINER_REPACK;
     }
     if lower.ends_with(".wav") || lower.ends_with(".bmp") || lower.ends_with(".raw") {
         return FILTER_BYTE_DELTA;
@@ -23,8 +37,10 @@ pub fn select_optimal_filter(file_path: &str, data: &[u8]) -> u8 {
 pub fn apply_filter(filter_mask: u8, data: &[u8]) -> Vec<u8> {
     match filter_mask {
         FILTER_X86_BCJ => apply_x86_bcj(data),
+        FILTER_ARM64_BCJ => apply_arm64_bcj(data),
         FILTER_BYTE_DELTA => apply_byte_delta(data),
         FILTER_BYTE_SHUFFLE => apply_byte_shuffle_4(data),
+        FILTER_CONTAINER_REPACK => apply_container_repack(data),
         _ => data.to_vec(),
     }
 }
@@ -32,8 +48,10 @@ pub fn apply_filter(filter_mask: u8, data: &[u8]) -> Vec<u8> {
 pub fn reverse_filter(filter_mask: u8, data: &[u8]) -> Vec<u8> {
     match filter_mask {
         FILTER_X86_BCJ => reverse_x86_bcj(data),
+        FILTER_ARM64_BCJ => reverse_arm64_bcj(data),
         FILTER_BYTE_DELTA => reverse_byte_delta(data),
         FILTER_BYTE_SHUFFLE => reverse_byte_shuffle_4(data),
+        FILTER_CONTAINER_REPACK => reverse_container_repack(data),
         _ => data.to_vec(),
     }
 }
@@ -148,6 +166,63 @@ fn reverse_x86_bcj(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// ARM64 Branch-with-Link (BL: top 6 bits = 0b100101) relative-to-absolute 26-bit word filter.
+fn apply_arm64_bcj(data: &[u8]) -> Vec<u8> {
+    let mut out = data.to_vec();
+    let chunks = out.len() / 4;
+    for idx in 0..chunks {
+        let pos = idx * 4;
+        let insn = u32::from_le_bytes([out[pos], out[pos + 1], out[pos + 2], out[pos + 3]]);
+        if (insn & 0xFC00_0000) == 0x9400_0000 {
+            let imm26 = insn & 0x03FF_FFFF;
+            let abs26 = imm26.wrapping_add(idx as u32) & 0x03FF_FFFF;
+            let patched = (0x9400_0000 | abs26).to_le_bytes();
+            out[pos..pos + 4].copy_from_slice(&patched);
+        }
+    }
+    out
+}
+
+fn reverse_arm64_bcj(data: &[u8]) -> Vec<u8> {
+    let mut out = data.to_vec();
+    let chunks = out.len() / 4;
+    for idx in 0..chunks {
+        let pos = idx * 4;
+        let insn = u32::from_le_bytes([out[pos], out[pos + 1], out[pos + 2], out[pos + 3]]);
+        if (insn & 0xFC00_0000) == 0x9400_0000 {
+            let abs26 = insn & 0x03FF_FFFF;
+            let imm26 = abs26.wrapping_sub(idx as u32) & 0x03FF_FFFF;
+            let restored = (0x9400_0000 | imm26).to_le_bytes();
+            out[pos..pos + 4].copy_from_slice(&restored);
+        }
+    }
+    out
+}
+
+/// Bit-exact reversible container header normalizer for PK\x03\x04 / PK\x01\x02 ZIP/Office/JAR streams.
+fn apply_container_repack(data: &[u8]) -> Vec<u8> {
+    let mut out = data.to_vec();
+    if out.len() < 30 {
+        return out;
+    }
+    let mut i = 0usize;
+    while i + 30 <= out.len() {
+        if &out[i..i + 4] == b"PK\x03\x04" {
+            // XOR local header fixed offsets with standard template so repeated ZIP headers collapse to zeros
+            out[i + 4] ^= 0x14;
+            out[i + 8] ^= 0x08;
+            i += 30;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn reverse_container_repack(data: &[u8]) -> Vec<u8> {
+    apply_container_repack(data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,7 +231,13 @@ mod tests {
     fn test_filters_lossless_roundtrip() {
         let sample: Vec<u8> = (0..1025).map(|i| ((i * 37) & 0xFF) as u8).collect();
 
-        for filter in [FILTER_BYTE_DELTA, FILTER_BYTE_SHUFFLE, FILTER_X86_BCJ] {
+        for filter in [
+            FILTER_BYTE_DELTA,
+            FILTER_BYTE_SHUFFLE,
+            FILTER_X86_BCJ,
+            FILTER_ARM64_BCJ,
+            FILTER_CONTAINER_REPACK,
+        ] {
             let filtered = apply_filter(filter, &sample);
             let restored = reverse_filter(filter, &filtered);
             assert_eq!(restored, sample);

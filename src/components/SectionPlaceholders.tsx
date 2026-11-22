@@ -14,11 +14,14 @@ import {
   Lock,
   UploadCloud,
   Sliders,
+  Folder,
+  FileText,
 } from "lucide-react";
 import {
   ArchiveFormat,
   CompressionMode,
   EngineStatusPayload,
+  FsNode,
   NavSection,
   OperationResult,
   PipelineJobReport,
@@ -53,6 +56,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
     status.config.worker_threads
   );
   const [dictionarySizeKb, setDictionarySizeKb] = useState<number>(64);
+  const [splitVolumeMb, setSplitVolumeMb] = useState<number>(0);
   const [solidBlocks, setSolidBlocks] = useState<boolean>(true);
   const [fastCdcDedup, setFastCdcDedup] = useState<boolean>(
     status.config.enable_fastcdc_dedup
@@ -62,6 +66,12 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
   );
   const [createPassword, setCreatePassword] = useState<string>("");
   const [dragActive, setDragActive] = useState<boolean>(false);
+
+  const [browserOpen, setBrowserOpen] = useState<boolean>(false);
+  const [browserDir, setBrowserDir] = useState<string>(
+    "C:\\projects\\kinetic compression"
+  );
+  const [browserNodes, setBrowserNodes] = useState<FsNode[]>([]);
 
   const [opResult, setOpResult] = useState<OperationResult | null>(null);
   const [opError, setOpError] = useState<string | null>(null);
@@ -113,6 +123,20 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
     };
   }, [section]);
 
+  const openDiskBrowser = async (dir?: string) => {
+    const target = dir || browserDir;
+    try {
+      const nodes = await invoke<FsNode[]>("browse_filesystem_cmd", {
+        dirPath: target,
+      });
+      setBrowserDir(target);
+      setBrowserNodes(nodes);
+      setBrowserOpen(true);
+    } catch (err) {
+      setOpError(String(err));
+    }
+  };
+
   const handleCreateArchive = async () => {
     setBusy(true);
     setOpError(null);
@@ -138,6 +162,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
           format: selectedFormat,
           mode: selectedMode,
           password: createPassword.trim().length > 0 ? createPassword : null,
+          split_volume_mb: splitVolumeMb > 0 ? splitVolumeMb : null,
         },
       });
       setOpResult(res);
@@ -214,12 +239,102 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
             <FilePlus2 size={16} /> Create Archive (Advanced Compression
             Configurator)
           </span>
-          <span className="badge badge-accent">
-            Default: .zip • Native: .kinetic v1.0
-          </span>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button
+              className="btn"
+              onClick={() => openDiskBrowser()}
+              style={{ padding: "4px 10px", fontSize: "12px" }}
+            >
+              <Folder size={13} /> Browse Local Disk
+            </button>
+            <span className="badge badge-accent">
+              Default: .zip • Native: .kinetic v1.0
+            </span>
+          </div>
         </div>
 
-        {/* Drag and Drop Files/Folders Zone */}
+        {browserOpen && (
+          <div
+            className="card"
+            style={{
+              marginBottom: "14px",
+              borderColor: "var(--accent-primary)",
+              backgroundColor: "var(--bg-elevated)",
+            }}
+          >
+            <div className="card-header">
+              <span className="card-title">
+                <Folder size={14} /> Disk Browser: {browserDir}
+              </span>
+              <button
+                className="btn"
+                onClick={() => setBrowserOpen(false)}
+                style={{ padding: "3px 8px", fontSize: "11px" }}
+              >
+                Close Browser
+              </button>
+            </div>
+            <div
+              style={{
+                maxHeight: "180px",
+                overflowY: "auto",
+                display: "flex",
+                flexDirection: "column",
+                gap: "4px",
+              }}
+            >
+              {browserNodes.map((node) => (
+                <div
+                  key={node.path}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    padding: "6px 8px",
+                    borderRadius: "6px",
+                    backgroundColor: "var(--bg-surface)",
+                  }}
+                >
+                  <span
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "8px",
+                      cursor: node.is_dir ? "pointer" : "default",
+                      fontWeight: node.is_dir ? 600 : 400,
+                    }}
+                    onClick={() => {
+                      if (node.is_dir) openDiskBrowser(node.path);
+                    }}
+                  >
+                    {node.is_dir ? (
+                      <Folder size={14} color="var(--accent-primary)" />
+                    ) : (
+                      <FileText size={14} />
+                    )}
+                    {node.name}
+                  </span>
+                  {node.name !== ".. (Parent Directory)" && (
+                    <button
+                      className="btn"
+                      style={{ padding: "2px 8px", fontSize: "11px" }}
+                      onClick={() => {
+                        setSourceInput((prev) =>
+                          prev.trim().length > 0
+                            ? `${prev}; ${node.path}`
+                            : node.path
+                        );
+                      }}
+                    >
+                      + Add to Queue
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div
           className={`dropzone ${dragActive ? "drag-active" : ""}`}
           onDragOver={(e) => {
@@ -311,7 +426,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
             >
               {status.compression_modes.map((m) => (
                 <option key={m.mode} value={m.mode}>
-                  {m.mode} — {m.description}
+                  {m.mode} - {m.description}
                 </option>
               ))}
             </select>
@@ -345,18 +460,32 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
         <div className="grid-3">
           <div className="form-group">
             <label className="form-label">
-              <Sliders size={13} /> Seed Dictionary / Window Size
+              <Sliders size={13} /> Seed Dictionary &amp; Multipart Split
             </label>
-            <select
-              className="form-select"
-              value={dictionarySizeKb}
-              onChange={(e) => setDictionarySizeKb(Number(e.target.value))}
-            >
-              <option value={64}>64 KB Auto-Trained Seed Dictionary</option>
-              <option value={4096}>4 MB Block Dictionary Window</option>
-              <option value={16384}>16 MB Micro-Solid Window</option>
-              <option value={32768}>32 MB Ultra Archival Window</option>
-            </select>
+            <div style={{ display: "flex", gap: "8px" }}>
+              <select
+                className="form-select"
+                style={{ flex: 1 }}
+                value={dictionarySizeKb}
+                onChange={(e) => setDictionarySizeKb(Number(e.target.value))}
+              >
+                <option value={64}>64 KB Seed Dict</option>
+                <option value={4096}>4 MB Window</option>
+                <option value={16384}>16 MB Solid</option>
+                <option value={32768}>32 MB Ultra</option>
+              </select>
+              <select
+                className="form-select"
+                style={{ flex: 1 }}
+                value={splitVolumeMb}
+                onChange={(e) => setSplitVolumeMb(Number(e.target.value))}
+              >
+                <option value={0}>Single Volume</option>
+                <option value={10}>Split: 10 MB (.001)</option>
+                <option value={100}>Split: 100 MB (.001)</option>
+                <option value={700}>Split: 700 MB (.001)</option>
+              </select>
+            </div>
           </div>
 
           <div className="form-group">
@@ -382,7 +511,9 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
                 fontSize: "12.5px",
               }}
             >
-              <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <label
+                style={{ display: "flex", alignItems: "center", gap: "6px" }}
+              >
                 <input
                   type="checkbox"
                   checked={solidBlocks}
@@ -390,7 +521,9 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
                 />
                 <span>16 MB Indexed Micro-Solid Grouping</span>
               </label>
-              <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <label
+                style={{ display: "flex", alignItems: "center", gap: "6px" }}
+              >
                 <input
                   type="checkbox"
                   checked={fastCdcDedup}
@@ -398,7 +531,9 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
                 />
                 <span>FastCDC Global Chunk Deduplication</span>
               </label>
-              <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <label
+                style={{ display: "flex", alignItems: "center", gap: "6px" }}
+              >
                 <input
                   type="checkbox"
                   checked={kineticShield}
@@ -499,7 +634,9 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
           </div>
 
           <div className="form-group">
-            <label className="form-label">Decryption Password (If Encrypted)</label>
+            <label className="form-label">
+              Decryption Password (If Encrypted)
+            </label>
             <input
               type="password"
               className="form-input"
@@ -573,7 +710,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
               }}
             >
               <span>
-                <strong>{telemetry?.current_operation || "Ready"}</strong> —{" "}
+                <strong>{telemetry?.current_operation || "Ready"}</strong> -{" "}
                 {telemetry?.current_file || "No active file"}
               </span>
               <strong>{telemetry ? telemetry.progress_percent : 0}%</strong>
@@ -588,7 +725,6 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
             </div>
           </div>
 
-          {/* Rolling 24-Sample Throughput Sparkline Chart */}
           <div style={{ marginBottom: "16px" }}>
             <div
               style={{
@@ -606,7 +742,10 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
                   key={idx}
                   className="telemetry-bar"
                   style={{
-                    height: `${Math.max(6, Math.min(100, (val / maxSpeed) * 100))}%`,
+                    height: `${Math.max(
+                      6,
+                      Math.min(100, (val / maxSpeed) * 100)
+                    )}%`,
                   }}
                   title={`${val.toFixed(1)} MB/s`}
                 />
@@ -619,7 +758,8 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
               <div className="metric-row">
                 <span>Processing Speed</span>
                 <strong>
-                  {telemetry ? telemetry.throughput_mb_s.toFixed(2) : "0.00"} MB/s
+                  {telemetry ? telemetry.throughput_mb_s.toFixed(2) : "0.00"}{" "}
+                  MB/s
                 </strong>
               </div>
               <div className="metric-row">
@@ -736,7 +876,7 @@ export const SectionWorkspace: React.FC<SectionWorkspaceProps> = ({
               >
                 {status.compression_modes.map((m) => (
                   <option key={m.mode} value={m.mode}>
-                    {m.mode} — {m.description}
+                    {m.mode} - {m.description}
                   </option>
                 ))}
               </select>

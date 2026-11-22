@@ -2,10 +2,11 @@ pub mod commands;
 pub mod state;
 
 use commands::{
-    audit_archive_cmd, cancel_job_cmd, clear_recent_history, create_archive_cmd,
-    extract_archive_cmd, extract_selected_cmd, get_engine_status, get_live_telemetry_cmd,
-    inspect_archive_cmd, pause_job_cmd, repair_archive_cmd, resume_job_cmd,
-    run_engine_pipeline_job_cmd, update_user_config, validate_archive_cmd,
+    append_entries_cmd, audit_archive_cmd, browse_filesystem_cmd, cancel_job_cmd,
+    clear_recent_history, create_archive_cmd, delete_entry_cmd, extract_archive_cmd,
+    extract_selected_cmd, get_engine_status, get_live_telemetry_cmd, inspect_archive_cmd,
+    join_archive_cmd, pause_job_cmd, preview_entry_cmd, repair_archive_cmd, resume_job_cmd,
+    run_engine_pipeline_job_cmd, split_archive_cmd, update_user_config, validate_archive_cmd,
 };
 use state::AppState;
 
@@ -21,6 +22,12 @@ pub fn run() {
             validate_archive_cmd,
             audit_archive_cmd,
             repair_archive_cmd,
+            preview_entry_cmd,
+            delete_entry_cmd,
+            append_entries_cmd,
+            split_archive_cmd,
+            join_archive_cmd,
+            browse_filesystem_cmd,
             create_archive_cmd,
             extract_archive_cmd,
             extract_selected_cmd,

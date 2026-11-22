@@ -9,8 +9,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use kinetic_core::{ArchiveFormat, CompressionMode};
 use kinetic_format::archive::{
-    create_kinetic_archive, read_and_verify_block, read_kinetic_index, repair_kinetic_archive,
-    validate_kinetic_archive, KineticWriteOptions,
+    append_files_to_kinetic_archive, create_kinetic_archive, read_and_verify_block,
+    read_kinetic_index, reassemble_multipart_volumes, remove_entry_from_kinetic_archive,
+    repair_kinetic_archive, split_archive_into_volumes, validate_kinetic_archive,
+    KineticWriteOptions,
 };
 use kinetic_format::KINETIC_MAGIC;
 use serde::{Deserialize, Serialize};
@@ -61,6 +63,16 @@ pub struct ArchiveInspection {
     pub total_entries: usize,
     pub total_uncompressed_bytes: u64,
     pub entries: Vec<ArchiveEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryPreview {
+    pub path: String,
+    pub size_bytes: u64,
+    pub is_text: bool,
+    pub text_preview: String,
+    pub hex_preview: String,
+    pub codec_name: String,
 }
 
 pub fn detect_format(path: &Path, initial_bytes: Option<&[u8]>) -> Option<ArchiveFormat> {
@@ -166,7 +178,6 @@ pub fn inspect_archive(archive_path: &Path) -> Result<ArchiveInspection, CompatE
     inspect_archive_with_password(archive_path, None)
 }
 
-/// Performs a pre-extraction security audit checking paths, device names, integer overflows, and bomb ratios.
 pub fn audit_archive_security(
     archive_path: &Path,
     password: Option<&str>,
@@ -198,7 +209,6 @@ pub fn audit_archive_security(
     })
 }
 
-/// Attempts physical repair of a `.kinetic` archive using its Kinetic Shield XOR parity block.
 pub fn repair_archive(
     archive_path: &Path,
     password: Option<&str>,
@@ -223,6 +233,176 @@ pub fn repair_archive(
                 .to_string(),
         )),
     }
+}
+
+fn format_hex_dump(bytes: &[u8]) -> String {
+    let mut lines = Vec::new();
+    for (i, chunk) in bytes.chunks(16).take(64).enumerate() {
+        let offset = i * 16;
+        let hex_part: Vec<String> = chunk.iter().map(|b| format!("{:02X}", b)).collect();
+        let ascii_part: String = chunk
+            .iter()
+            .map(|&b| {
+                if (0x20..=0x7E).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        lines.push(format!(
+            "{:08X}  {:<47}  |{}|",
+            offset,
+            hex_part.join(" "),
+            ascii_part
+        ));
+    }
+    lines.join("\n")
+}
+
+pub fn preview_archive_entry(
+    archive_path: &Path,
+    entry_path: &str,
+    password: Option<&str>,
+) -> Result<EntryPreview, CompatError> {
+    let format = detect_format_from_disk(archive_path)?;
+    let norm_target = entry_path.replace('\\', "/");
+
+    let (sample_bytes, total_size, codec_label) = match format {
+        ArchiveFormat::Kinetic => {
+            let (_header, index, crypto_key) = read_kinetic_index(archive_path, password)
+                .map_err(|e| CompatError::Format(e.to_string()))?;
+            let entry = index
+                .files
+                .iter()
+                .find(|f| f.path == norm_target)
+                .ok_or_else(|| {
+                    CompatError::Format(format!("Entry '{}' not found in archive", entry_path))
+                })?;
+
+            let mut f = File::open(archive_path)?;
+            let mut buf = Vec::new();
+            if let Some(&first_bid) = entry.block_ids.first() {
+                if let Some(desc) = index.blocks.iter().find(|b| b.block_id == first_bid) {
+                    let raw = read_and_verify_block(
+                        &mut f,
+                        desc,
+                        &index.blocks,
+                        index.parity_offset,
+                        index.parity_length,
+                        crypto_key.as_ref(),
+                    )
+                    .map_err(|e| CompatError::Format(e.to_string()))?;
+                    let take_len = raw.len().min(16 * 1024);
+                    buf.extend_from_slice(&raw[..take_len]);
+                }
+            }
+            (buf, entry.uncompressed_size, entry.codec_summary.clone())
+        }
+        ArchiveFormat::Zip => {
+            let file = File::open(archive_path)?;
+            let mut zip = ZipArchive::new(file).map_err(|e| CompatError::Format(e.to_string()))?;
+            let mut found = None;
+            for i in 0..zip.len() {
+                let mut entry = zip
+                    .by_index(i)
+                    .map_err(|e| CompatError::Format(e.to_string()))?;
+                if entry.name().replace('\\', "/").trim_end_matches('/') == norm_target {
+                    let mut buf = vec![0u8; (entry.size() as usize).min(16 * 1024)];
+                    let n = entry.read(&mut buf)?;
+                    buf.truncate(n);
+                    found = Some((buf, entry.size(), format!("{:?}", entry.compression())));
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                CompatError::Format(format!("Entry '{}' not found in ZIP", entry_path))
+            })?
+        }
+        _ => {
+            return Err(CompatError::Unsupported(
+                "In-memory preview is supported for .kinetic and .zip archives.".to_string(),
+            ))
+        }
+    };
+
+    let is_text = !sample_bytes.contains(&0) && std::str::from_utf8(&sample_bytes).is_ok();
+    let text_preview = String::from_utf8_lossy(&sample_bytes).into_owned();
+    let hex_preview = format_hex_dump(&sample_bytes);
+
+    Ok(EntryPreview {
+        path: norm_target,
+        size_bytes: total_size,
+        is_text,
+        text_preview,
+        hex_preview,
+        codec_name: codec_label,
+    })
+}
+
+pub fn delete_archive_entry(
+    archive_path: &Path,
+    entry_path: &str,
+    password: Option<&str>,
+) -> Result<String, CompatError> {
+    let format = detect_format_from_disk(archive_path)?;
+    match format {
+        ArchiveFormat::Kinetic => {
+            let removed = remove_entry_from_kinetic_archive(archive_path, entry_path, password)
+                .map_err(|e| CompatError::Format(e.to_string()))?;
+            Ok(format!(
+                "Zero-recompression update complete: removed {} entry ('{}') from .kinetic index.",
+                removed, entry_path
+            ))
+        }
+        _ => Err(CompatError::Unsupported(
+            "Zero-recompression in-place deletion is an exclusive feature of the native .kinetic format."
+                .to_string(),
+        )),
+    }
+}
+
+pub fn append_archive_entries(
+    archive_path: &Path,
+    new_sources: &[PathBuf],
+    password: Option<&str>,
+) -> Result<String, CompatError> {
+    let format = detect_format_from_disk(archive_path)?;
+    match format {
+        ArchiveFormat::Kinetic => {
+            let added = append_files_to_kinetic_archive(archive_path, new_sources, password)
+                .map_err(|e| CompatError::Format(e.to_string()))?;
+            Ok(format!(
+                "Zero-recompression append complete: added {} file(s) to .kinetic archive.",
+                added
+            ))
+        }
+        _ => Err(CompatError::Unsupported(
+            "Zero-recompression appending is an exclusive feature of the native .kinetic format."
+                .to_string(),
+        )),
+    }
+}
+
+pub fn split_archive_volumes(
+    archive_path: &Path,
+    volume_size_mb: u64,
+) -> Result<Vec<String>, CompatError> {
+    let bytes = volume_size_mb.max(1) * 1024 * 1024;
+    let parts = split_archive_into_volumes(archive_path, bytes)
+        .map_err(|e| CompatError::Format(e.to_string()))?;
+    Ok(parts
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect())
+}
+
+pub fn join_archive_volumes(
+    first_volume_path: &Path,
+    output_archive_path: &Path,
+) -> Result<u64, CompatError> {
+    reassemble_multipart_volumes(first_volume_path, output_archive_path)
+        .map_err(|e| CompatError::Format(e.to_string()))
 }
 
 pub fn validate_archive_with_password(
@@ -278,6 +458,7 @@ pub fn create_archive_with_options(
                 enable_fastcdc_dedup,
                 enable_entropy_bypass,
                 enable_kinetic_shield_parity,
+                ..Default::default()
             };
             create_kinetic_archive(source_paths, output_path, &opts)
                 .map_err(|e| CompatError::Format(e.to_string()))
@@ -639,6 +820,10 @@ mod tests {
         assert_eq!(inspection.format, ArchiveFormat::Kinetic);
         assert_eq!(inspection.total_entries, 1);
 
+        let preview = preview_archive_entry(&knt_path, "native_engine.txt", None).unwrap();
+        assert!(preview.is_text);
+        assert!(preview.text_preview.contains("Kinetic Engine Phase 5"));
+
         let report = validate_archive(&knt_path).unwrap();
         assert!(report.valid);
 
@@ -689,7 +874,6 @@ mod tests {
         std::fs::write(&f1, b"Alpha block data for physical disk repair test".repeat(128)).unwrap();
         std::fs::write(&f2, b"Beta block data for physical disk repair test".repeat(128)).unwrap();
 
-        // Create a stale .part file and verify cleanup_interrupted_staging_files removes it
         let stale_part = dir.path().join("aborted.kinetic.part");
         std::fs::write(&stale_part, b"partial data").unwrap();
         assert_eq!(cleanup_interrupted_staging_files(dir.path()).unwrap(), 1);

@@ -116,6 +116,22 @@ export interface IntegrityReport {
   message: string;
 }
 
+export interface EntryPreview {
+  path: string;
+  size_bytes: number;
+  is_text: boolean;
+  text_preview: string;
+  hex_preview: string;
+  codec_name: string;
+}
+
+export interface FsNode {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size_bytes: number;
+}
+
 export interface OperationResult {
   success: boolean;
   message: string;

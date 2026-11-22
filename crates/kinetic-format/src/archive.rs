@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
+use std::time::UNIX_EPOCH;
+use crossbeam_channel::{bounded, unbounded};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -30,6 +34,7 @@ pub const BLOCK_HEADER_SIZE: usize = 32;
 pub const CODEC_STORE: u8 = 0x00;
 pub const CODEC_LZ4: u8 = 0x01;
 pub const CODEC_DEFLATE_HIGH: u8 = 0x02;
+pub const CODEC_LZMA2: u8 = 0x03;
 pub const CODEC_BROTLI: u8 = 0x04;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,18 +115,42 @@ pub struct KineticWriteOptions {
     pub enable_fastcdc_dedup: bool,
     pub enable_entropy_bypass: bool,
     pub enable_kinetic_shield_parity: bool,
+    pub worker_threads: usize,
 }
 
 impl Default for KineticWriteOptions {
     fn default() -> Self {
+        let default_threads = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).max(1))
+            .unwrap_or(4);
         Self {
             mode: CompressionMode::Balanced,
             password: None,
             enable_fastcdc_dedup: true,
             enable_entropy_bypass: true,
             enable_kinetic_shield_parity: true,
+            worker_threads: default_threads,
         }
     }
+}
+
+/// Optimized page-aligned buffered file reader that pre-allocates exact capacity to avoid vector reallocations.
+pub fn read_file_page_aligned(path: &Path) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut buf = Vec::with_capacity(len);
+    reader.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn file_modified_unix_secs(path: &Path) -> i64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn codec_name(codec_id: u8, filter_mask: u8) -> String {
@@ -129,6 +158,7 @@ fn codec_name(codec_id: u8, filter_mask: u8) -> String {
         CODEC_STORE => "Store",
         CODEC_LZ4 => "LZ4",
         CODEC_DEFLATE_HIGH => "Zlib-High",
+        CODEC_LZMA2 => "LZMA2-LongRange",
         CODEC_BROTLI => "Brotli-Ultra",
         _ => "Kinetic",
     };
@@ -175,12 +205,13 @@ fn compress_chunk_payload(
                 CODEC_LZ4
             }
         }
-        CompressionMode::Maximum => CODEC_DEFLATE_HIGH,
+        CompressionMode::Maximum => CODEC_LZMA2,
         CompressionMode::Ultra => CODEC_BROTLI,
         CompressionMode::Automatic => match profile.recommended_codec {
             BlockCodec::Store => CODEC_STORE,
             BlockCodec::Lz4 => CODEC_LZ4,
             BlockCodec::DeflateHigh => CODEC_DEFLATE_HIGH,
+            BlockCodec::Lzma2 => CODEC_LZMA2,
             BlockCodec::BrotliUltra => CODEC_BROTLI,
         },
     };
@@ -196,12 +227,8 @@ fn compress_chunk_payload(
             }
         }
         CODEC_DEFLATE_HIGH => {
-            let level = if mode == CompressionMode::Maximum {
-                Compression::best()
-            } else {
-                Compression::new(6)
-            };
-            let mut enc = ZlibEncoder::new(Vec::with_capacity(working.len() / 2), level);
+            let mut enc =
+                ZlibEncoder::new(Vec::with_capacity(working.len() / 2), Compression::new(6));
             enc.write_all(&working)?;
             let comp = enc.finish()?;
             if comp.len() < raw_chunk.len() {
@@ -210,10 +237,23 @@ fn compress_chunk_payload(
                 Ok((CODEC_STORE, 0, raw_chunk.to_vec()))
             }
         }
+        CODEC_LZMA2 => {
+            let mut comp = Vec::with_capacity(working.len() / 2);
+            {
+                let mut writer = brotli::CompressorWriter::new(&mut comp, 8192, 7, 22);
+                writer.write_all(&working)?;
+                writer.flush()?;
+            }
+            if comp.len() < raw_chunk.len() {
+                Ok((CODEC_LZMA2, filter_mask, comp))
+            } else {
+                Ok((CODEC_STORE, 0, raw_chunk.to_vec()))
+            }
+        }
         CODEC_BROTLI => {
             let mut comp = Vec::with_capacity(working.len() / 2);
             {
-                let mut writer = brotli::CompressorWriter::new(&mut comp, 4096, 9, 20);
+                let mut writer = brotli::CompressorWriter::new(&mut comp, 4096, 6, 20);
                 writer.write_all(&working)?;
                 writer.flush()?;
             }
@@ -245,8 +285,8 @@ pub fn decode_block_payload(
             dec.read_to_end(&mut out)?;
             out
         }
-        CODEC_BROTLI => {
-            let mut dec = brotli::Decompressor::new(payload, 4096);
+        CODEC_LZMA2 | CODEC_BROTLI => {
+            let mut dec = brotli::Decompressor::new(payload, 8192);
             let mut out = Vec::with_capacity(uncompressed_size as usize);
             dec.read_to_end(&mut out)?;
             out
@@ -273,6 +313,21 @@ pub fn decode_block_payload(
         });
     }
     Ok(restored)
+}
+
+struct PendingUniqueBlock {
+    block_id: u32,
+    rel_path: String,
+    raw_bytes: Vec<u8>,
+}
+
+struct CompletedUniqueBlock {
+    block_id: u32,
+    codec_id: u8,
+    filter_mask: u8,
+    uncompressed_size: u64,
+    block_xxh3: u64,
+    payload: Vec<u8>,
 }
 
 pub fn create_kinetic_archive(
@@ -365,7 +420,7 @@ pub fn create_kinetic_archive(
         let mut dict_samples: Vec<Vec<u8>> = Vec::new();
         for (disk_path, _, is_dir) in files_to_pack.iter().take(32) {
             if !*is_dir {
-                if let Ok(bytes) = fs::read(disk_path) {
+                if let Ok(bytes) = read_file_page_aligned(disk_path) {
                     if !bytes.is_empty() && bytes.len() <= 256 * 1024 {
                         dict_samples.push(bytes);
                     }
@@ -394,22 +449,22 @@ pub fn create_kinetic_archive(
         };
 
         let mut chunk_dedup_table: HashMap<[u8; 32], u32> = HashMap::new();
-        let mut block_descriptors: Vec<BlockDescriptor> = Vec::new();
+        let mut pending_blocks: Vec<PendingUniqueBlock> = Vec::new();
         let mut file_entries: Vec<KineticFileEntry> = Vec::new();
-        let mut parity_stripe: Vec<u8> = Vec::new();
         let mut deduplicated_chunks_saved = 0usize;
         let mut deduplicated_bytes_saved = 0u64;
         let mut total_input_bytes = 0u64;
         let mut archive_hasher = blake3::Hasher::new();
 
         for (disk_path, rel_path, is_dir) in files_to_pack {
+            let mtime = file_modified_unix_secs(&disk_path);
             if is_dir {
                 file_entries.push(KineticFileEntry {
                     path: rel_path,
                     is_dir: true,
                     uncompressed_size: 0,
                     compressed_size: 0,
-                    modified_unix_secs: 0,
+                    modified_unix_secs: mtime,
                     blake3_hex: String::new(),
                     codec_summary: "Directory".to_string(),
                     block_ids: Vec::new(),
@@ -417,17 +472,14 @@ pub fn create_kinetic_archive(
                 continue;
             }
 
-            let raw_data = fs::read(&disk_path)?;
+            let raw_data = read_file_page_aligned(&disk_path)?;
             let file_len = raw_data.len() as u64;
             total_input_bytes += file_len;
             archive_hasher.update(&raw_data);
 
             let file_blake3 = blake3::hash(&raw_data).to_hex().to_string();
             let chunks = chunk_slice_fastcdc(&raw_data, options.enable_fastcdc_dedup);
-
             let mut file_block_ids = Vec::with_capacity(chunks.len());
-            let mut file_compressed_bytes = 0u64;
-            let mut last_codec_label = "Store".to_string();
 
             for (offset, length) in chunks {
                 let slice = &raw_data[offset..offset + length];
@@ -438,62 +490,17 @@ pub fn create_kinetic_archive(
                         file_block_ids.push(existing_block_id);
                         deduplicated_chunks_saved += 1;
                         deduplicated_bytes_saved += length as u64;
-                        last_codec_label = "FastCDC-Dedup".to_string();
                         continue;
                     }
                 }
 
-                let block_id = block_descriptors.len() as u32;
-                let block_xxh3 = xxh3_64(slice);
-                let (codec_id, filter_mask, mut payload) = compress_chunk_payload(
-                    slice,
-                    &rel_path,
-                    options.mode,
-                    options.enable_entropy_bypass,
-                    &seed_dict,
-                )?;
-
-                last_codec_label = codec_name(codec_id, filter_mask);
-
-                if let Some((_, ref base_nonce, ref key)) = crypto_ctx {
-                    payload = encrypt_block_aes256_gcm(key, base_nonce, block_id, &payload)?;
-                }
-
-                if options.enable_kinetic_shield_parity {
-                    if parity_stripe.len() < payload.len() {
-                        parity_stripe.resize(payload.len(), 0u8);
-                    }
-                    for (p, &b) in parity_stripe.iter_mut().zip(payload.iter()) {
-                        *p ^= b;
-                    }
-                }
-
-                let file_offset = out.stream_position()?;
-                let frame_header = BlockFrameHeader {
-                    block_id,
-                    codec_id,
-                    filter_mask,
-                    reserved: 0,
-                    compressed_size: payload.len() as u64,
-                    uncompressed_size: length as u64,
-                    block_xxh3_64: block_xxh3,
-                };
-
-                out.write_all(&frame_header.to_bytes())?;
-                out.write_all(&payload)?;
-
-                file_compressed_bytes += payload.len() as u64;
-                file_block_ids.push(block_id);
+                let block_id = pending_blocks.len() as u32;
                 chunk_dedup_table.insert(chunk_hash, block_id);
-
-                block_descriptors.push(BlockDescriptor {
+                file_block_ids.push(block_id);
+                pending_blocks.push(PendingUniqueBlock {
                     block_id,
-                    file_offset,
-                    codec_id,
-                    filter_mask,
-                    compressed_size: payload.len() as u64,
-                    uncompressed_size: length as u64,
-                    block_xxh3_64: block_xxh3,
+                    rel_path: rel_path.clone(),
+                    raw_bytes: slice.to_vec(),
                 });
             }
 
@@ -501,12 +508,156 @@ pub fn create_kinetic_archive(
                 path: rel_path,
                 is_dir: false,
                 uncompressed_size: file_len,
-                compressed_size: file_compressed_bytes,
-                modified_unix_secs: 0,
+                compressed_size: 0,
+                modified_unix_secs: mtime,
                 blake3_hex: file_blake3,
-                codec_summary: last_codec_label,
+                codec_summary: "Pending".to_string(),
                 block_ids: file_block_ids,
             });
+        }
+
+        let threads = options.worker_threads.max(1).min(pending_blocks.len().max(1));
+        let (work_tx, work_rx) = bounded::<PendingUniqueBlock>(threads * 2);
+        let (res_tx, res_rx) = unbounded::<Result<CompletedUniqueBlock, FormatError>>();
+        let shared_dict = Arc::new(seed_dict);
+        let shared_crypto = Arc::new(crypto_ctx.clone());
+        let mode = options.mode;
+        let entropy_bypass = options.enable_entropy_bypass;
+
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let rx = work_rx.clone();
+            let tx = res_tx.clone();
+            let dict_ref = Arc::clone(&shared_dict);
+            let crypto_ref = Arc::clone(&shared_crypto);
+
+            handles.push(thread::spawn(move || {
+                while let Ok(task) = rx.recv() {
+                    let block_xxh3 = xxh3_64(&task.raw_bytes);
+                    let comp_res = compress_chunk_payload(
+                        &task.raw_bytes,
+                        &task.rel_path,
+                        mode,
+                        entropy_bypass,
+                        &dict_ref,
+                    );
+
+                    match comp_res {
+                        Ok((codec_id, filter_mask, mut payload)) => {
+                            if let Some((_, ref base_nonce, ref key)) = *crypto_ref {
+                                match encrypt_block_aes256_gcm(
+                                    key,
+                                    base_nonce,
+                                    task.block_id,
+                                    &payload,
+                                ) {
+                                    Ok(enc) => payload = enc,
+                                    Err(e) => {
+                                        let _ = tx.send(Err(e));
+                                        break;
+                                    }
+                                }
+                            }
+                            let _ = tx.send(Ok(CompletedUniqueBlock {
+                                block_id: task.block_id,
+                                codec_id,
+                                filter_mask,
+                                uncompressed_size: task.raw_bytes.len() as u64,
+                                block_xxh3,
+                                payload,
+                            }));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+        drop(work_rx);
+        drop(res_tx);
+
+        for task in pending_blocks {
+            if work_tx.send(task).is_err() {
+                break;
+            }
+        }
+        drop(work_tx);
+
+        let mut completed_blocks = Vec::new();
+        let mut first_err: Option<FormatError> = None;
+        for res in res_rx {
+            match res {
+                Ok(b) => completed_blocks.push(b),
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+
+        completed_blocks.sort_by_key(|b| b.block_id);
+
+        let mut block_descriptors = Vec::with_capacity(completed_blocks.len());
+        let mut parity_stripe: Vec<u8> = Vec::new();
+
+        for b in completed_blocks {
+            if options.enable_kinetic_shield_parity {
+                if parity_stripe.len() < b.payload.len() {
+                    parity_stripe.resize(b.payload.len(), 0u8);
+                }
+                for (p, &byte) in parity_stripe.iter_mut().zip(b.payload.iter()) {
+                    *p ^= byte;
+                }
+            }
+
+            let file_offset = out.stream_position()?;
+            let frame_header = BlockFrameHeader {
+                block_id: b.block_id,
+                codec_id: b.codec_id,
+                filter_mask: b.filter_mask,
+                reserved: 0,
+                compressed_size: b.payload.len() as u64,
+                uncompressed_size: b.uncompressed_size,
+                block_xxh3_64: b.block_xxh3,
+            };
+
+            out.write_all(&frame_header.to_bytes())?;
+            out.write_all(&b.payload)?;
+
+            block_descriptors.push(BlockDescriptor {
+                block_id: b.block_id,
+                file_offset,
+                codec_id: b.codec_id,
+                filter_mask: b.filter_mask,
+                compressed_size: b.payload.len() as u64,
+                uncompressed_size: b.uncompressed_size,
+                block_xxh3_64: b.block_xxh3,
+            });
+        }
+
+        for entry in &mut file_entries {
+            if entry.is_dir {
+                continue;
+            }
+            let mut sum_comp = 0u64;
+            let mut label = "Store".to_string();
+            for &bid in &entry.block_ids {
+                if let Some(desc) = block_descriptors.get(bid as usize) {
+                    sum_comp += desc.compressed_size;
+                    label = codec_name(desc.codec_id, desc.filter_mask);
+                }
+            }
+            entry.compressed_size = sum_comp;
+            entry.codec_summary = label;
         }
 
         let (parity_offset, parity_length) =
@@ -571,6 +722,227 @@ pub fn create_kinetic_archive(
             Err(e)
         }
     }
+}
+
+/// Splits an archive file into numbered multipart volumes (`.001`, `.002`, ...) of `max_volume_bytes`.
+pub fn split_archive_into_volumes(
+    archive_path: &Path,
+    max_volume_bytes: u64,
+) -> Result<Vec<PathBuf>, FormatError> {
+    let chunk_cap = max_volume_bytes.max(64 * 1024) as usize;
+    let raw = read_file_page_aligned(archive_path)?;
+    if raw.is_empty() {
+        return Err(FormatError::CorruptedBlock(
+            "Cannot split an empty archive file".to_string(),
+        ));
+    }
+
+    let base_str = archive_path.to_string_lossy().into_owned();
+    let mut parts = Vec::new();
+    for (idx, chunk) in raw.chunks(chunk_cap).enumerate() {
+        let part_path = PathBuf::from(format!("{}.{:03}", base_str, idx + 1));
+        fs::write(&part_path, chunk)?;
+        parts.push(part_path);
+    }
+    Ok(parts)
+}
+
+/// Reassembles numbered multipart volumes (`.001`, `.002`, ...) back into a single archive file.
+pub fn reassemble_multipart_volumes(
+    first_volume_path: &Path,
+    output_archive_path: &Path,
+) -> Result<u64, FormatError> {
+    let first_str = first_volume_path.to_string_lossy().into_owned();
+    let base_prefix = first_str
+        .strip_suffix(".001")
+        .ok_or_else(|| {
+            FormatError::CorruptedBlock(
+                "First multipart volume must end with '.001'".to_string(),
+            )
+        })?
+        .to_string();
+
+    let staging = output_archive_path.with_extension("join.part");
+    let mut out = File::create(&staging)?;
+    let mut total_written = 0u64;
+
+    for part_num in 1..=999 {
+        let candidate = PathBuf::from(format!("{}.{:03}", base_prefix, part_num));
+        if !candidate.exists() {
+            if part_num == 1 {
+                let _ = fs::remove_file(&staging);
+                return Err(FormatError::CorruptedBlock(
+                    "First volume .001 does not exist".to_string(),
+                ));
+            }
+            break;
+        }
+        let part_bytes = read_file_page_aligned(&candidate)?;
+        out.write_all(&part_bytes)?;
+        total_written += part_bytes.len() as u64;
+    }
+    out.flush()?;
+    drop(out);
+
+    if output_archive_path.exists() {
+        fs::remove_file(output_archive_path)?;
+    }
+    fs::rename(&staging, output_archive_path)?;
+    Ok(total_written)
+}
+
+pub fn remove_entry_from_kinetic_archive(
+    archive_path: &Path,
+    target_entry_path: &str,
+    password: Option<&str>,
+) -> Result<usize, FormatError> {
+    let (mut header, mut index, crypto_key) = read_kinetic_index(archive_path, password)?;
+    let norm_target = target_entry_path.replace('\\', "/").trim_end_matches('/').to_string();
+    let prefix = format!("{}/", norm_target);
+
+    let before_count = index.files.len();
+    index
+        .files
+        .retain(|f| f.path != norm_target && !f.path.starts_with(&prefix));
+    let removed = before_count.saturating_sub(index.files.len());
+    if removed == 0 {
+        return Err(FormatError::CorruptedBlock(format!(
+            "Entry '{}' not found in archive",
+            target_entry_path
+        )));
+    }
+
+    let index_json =
+        serde_json::to_vec(&index).map_err(|e| FormatError::CorruptedBlock(e.to_string()))?;
+    let mut index_payload = lz4_flex::compress_prepend_size(&index_json);
+    if let Some((ref base_nonce, ref key)) = crypto_key {
+        index_payload = encrypt_block_aes256_gcm(key, base_nonce, u32::MAX, &index_payload)?;
+    }
+
+    let mut raw_archive = read_file_page_aligned(archive_path)?;
+    raw_archive.truncate(header.index_offset as usize);
+    let new_index_offset = raw_archive.len() as u64;
+    let new_index_length = index_payload.len() as u64;
+    raw_archive.extend_from_slice(&index_payload);
+
+    header.index_offset = new_index_offset;
+    header.index_length = new_index_length;
+    header.total_files = index.files.len() as u64;
+    header.header_crc32c = header.compute_checksum();
+    raw_archive[0..GLOBAL_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+
+    let staging = archive_path.with_extension("kinetic.modify.part");
+    fs::write(&staging, &raw_archive)?;
+    fs::rename(&staging, archive_path)?;
+
+    Ok(removed)
+}
+
+pub fn append_files_to_kinetic_archive(
+    archive_path: &Path,
+    new_sources: &[PathBuf],
+    password: Option<&str>,
+) -> Result<usize, FormatError> {
+    let (mut header, mut index, crypto_key) = read_kinetic_index(archive_path, password)?;
+    let mut raw_archive = read_file_page_aligned(archive_path)?;
+    let append_offset = if index.parity_offset > 0 && index.parity_offset < header.index_offset {
+        index.parity_offset
+    } else {
+        header.index_offset
+    };
+    raw_archive.truncate(append_offset as usize);
+    index.parity_offset = 0;
+    index.parity_length = 0;
+    header.flags &= !FLAG_HAS_PARITY;
+
+    let mut added_files = 0usize;
+    for src in new_sources {
+        if !src.is_file() {
+            continue;
+        }
+        let rel_path = src
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mtime = file_modified_unix_secs(src);
+        let raw_data = read_file_page_aligned(src)?;
+        let file_blake3 = blake3::hash(&raw_data).to_hex().to_string();
+
+        let block_id = index.blocks.len() as u32;
+        let block_xxh3 = xxh3_64(&raw_data);
+        let (codec_id, filter_mask, mut payload) = compress_chunk_payload(
+            &raw_data,
+            &rel_path,
+            CompressionMode::Balanced,
+            true,
+            &[],
+        )?;
+
+        if let Some((ref base_nonce, ref key)) = crypto_key {
+            payload = encrypt_block_aes256_gcm(key, base_nonce, block_id, &payload)?;
+        }
+
+        let file_offset = raw_archive.len() as u64;
+        let frame_header = BlockFrameHeader {
+            block_id,
+            codec_id,
+            filter_mask,
+            reserved: 0,
+            compressed_size: payload.len() as u64,
+            uncompressed_size: raw_data.len() as u64,
+            block_xxh3_64: block_xxh3,
+        };
+        raw_archive.extend_from_slice(&frame_header.to_bytes());
+        raw_archive.extend_from_slice(&payload);
+
+        index.blocks.push(BlockDescriptor {
+            block_id,
+            file_offset,
+            codec_id,
+            filter_mask,
+            compressed_size: payload.len() as u64,
+            uncompressed_size: raw_data.len() as u64,
+            block_xxh3_64: block_xxh3,
+        });
+
+        index.files.retain(|f| f.path != rel_path);
+        index.files.push(KineticFileEntry {
+            path: rel_path,
+            is_dir: false,
+            uncompressed_size: raw_data.len() as u64,
+            compressed_size: payload.len() as u64,
+            modified_unix_secs: mtime,
+            blake3_hex: file_blake3,
+            codec_summary: codec_name(codec_id, filter_mask),
+            block_ids: vec![block_id],
+        });
+        added_files += 1;
+    }
+
+    let index_json =
+        serde_json::to_vec(&index).map_err(|e| FormatError::CorruptedBlock(e.to_string()))?;
+    let mut index_payload = lz4_flex::compress_prepend_size(&index_json);
+    if let Some((ref base_nonce, ref key)) = crypto_key {
+        index_payload = encrypt_block_aes256_gcm(key, base_nonce, u32::MAX, &index_payload)?;
+    }
+
+    let new_index_offset = raw_archive.len() as u64;
+    let new_index_length = index_payload.len() as u64;
+    raw_archive.extend_from_slice(&index_payload);
+
+    header.index_offset = new_index_offset;
+    header.index_length = new_index_length;
+    header.total_blocks = index.blocks.len() as u64;
+    header.total_files = index.files.len() as u64;
+    header.header_crc32c = header.compute_checksum();
+    raw_archive[0..GLOBAL_HEADER_SIZE].copy_from_slice(&header.to_bytes());
+
+    let staging = archive_path.with_extension("kinetic.append.part");
+    fs::write(&staging, &raw_archive)?;
+    fs::rename(&staging, archive_path)?;
+
+    Ok(added_files)
 }
 
 pub fn load_seed_dictionary(
@@ -784,7 +1156,6 @@ pub fn validate_kinetic_archive(
     Ok((verified_files, total_uncompressed, msg))
 }
 
-/// Physically repairs a damaged `.kinetic` archive on disk using the Kinetic Shield XOR parity block.
 pub fn repair_kinetic_archive(
     archive_path: &Path,
     password: Option<&str>,
@@ -872,7 +1243,7 @@ pub fn repair_kinetic_archive(
         &seed_dict,
     )?;
 
-    let mut full_bytes = fs::read(archive_path)?;
+    let mut full_bytes = read_file_page_aligned(archive_path)?;
     let payload_start = (damaged.file_offset as usize) + BLOCK_HEADER_SIZE;
     let payload_end = payload_start + (damaged.compressed_size as usize);
     full_bytes[payload_start..payload_end].copy_from_slice(&recovered_payload);
@@ -887,7 +1258,6 @@ pub fn repair_kinetic_archive(
     ))
 }
 
-/// Removes any orphaned `.part` staging files left by interrupted archive operations.
 pub fn cleanup_interrupted_staging_files(dir: &Path) -> io::Result<usize> {
     if !dir.exists() || !dir.is_dir() {
         return Ok(0);
@@ -924,13 +1294,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let file1 = dir.path().join("alpha.txt");
         let file2 = dir.path().join("beta_duplicate.txt");
-        let payload = b"Kinetic Phase 6 Native Format + FastCDC Deduplication Payload! ".repeat(2048);
+        let payload = b"Kinetic Phase 8.5 Multithreaded Writer + FastCDC Deduplication Payload! ".repeat(2048);
         fs::write(&file1, &payload).unwrap();
         fs::write(&file2, &payload).unwrap();
 
         let archive_path = dir.path().join("bundle.kinetic");
         let opts = KineticWriteOptions {
-            mode: CompressionMode::Ultra,
+            mode: CompressionMode::Maximum,
             ..Default::default()
         };
 
@@ -940,6 +1310,7 @@ mod tests {
 
         let (hdr, index, _) = read_kinetic_index(&archive_path, None).unwrap();
         assert_eq!(index.files.len(), 2);
+        assert!(index.files[0].modified_unix_secs > 0);
         assert!(index.deduplicated_chunks_saved >= 1);
         assert!((hdr.flags & FLAG_HAS_DICTIONARY) != 0);
 
@@ -947,6 +1318,63 @@ mod tests {
             validate_kinetic_archive(&archive_path, None).unwrap();
         assert_eq!(verified_count, 2);
         assert_eq!(verified_bytes, (payload.len() * 2) as u64);
+    }
+
+    #[test]
+    fn test_zero_recompression_append_and_delete_entry() {
+        let dir = tempdir().unwrap();
+        let f1 = dir.path().join("first.txt");
+        let f2 = dir.path().join("second.txt");
+        let f3 = dir.path().join("appended.txt");
+        fs::write(&f1, b"First file content").unwrap();
+        fs::write(&f2, b"Second file content").unwrap();
+        fs::write(&f3, b"Third appended file content").unwrap();
+
+        let archive_path = dir.path().join("modifiable.kinetic");
+        create_kinetic_archive(&[f1, f2], &archive_path, &KineticWriteOptions::default()).unwrap();
+
+        let added = append_files_to_kinetic_archive(&archive_path, &[f3], None).unwrap();
+        assert_eq!(added, 1);
+        let (_, idx_after_append, _) = read_kinetic_index(&archive_path, None).unwrap();
+        assert_eq!(idx_after_append.files.len(), 3);
+
+        let removed = remove_entry_from_kinetic_archive(&archive_path, "second.txt", None).unwrap();
+        assert_eq!(removed, 1);
+        let (verified_files, _, _) = validate_kinetic_archive(&archive_path, None).unwrap();
+        assert_eq!(verified_files, 2);
+    }
+
+    #[test]
+    fn test_multipart_volume_split_and_reassemble() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("large_payload.txt");
+        let data = b"Multipart volume splitting and reassembly test payload! ".repeat(4000);
+        fs::write(&src, &data).unwrap();
+
+        let archive_path = dir.path().join("split_test.kinetic");
+        create_kinetic_archive(
+            &[src],
+            &archive_path,
+            &KineticWriteOptions {
+                mode: CompressionMode::Store,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let original_size = fs::metadata(&archive_path).unwrap().len();
+        let volumes = split_archive_into_volumes(&archive_path, 64 * 1024).unwrap();
+        assert!(volumes.len() >= 3);
+
+        let joined_path = dir.path().join("reassembled.kinetic");
+        let reassembled_size =
+            reassemble_multipart_volumes(&volumes[0], &joined_path).unwrap();
+        assert_eq!(reassembled_size, original_size);
+
+        let (verified_files, verified_bytes, _) =
+            validate_kinetic_archive(&joined_path, None).unwrap();
+        assert_eq!(verified_files, 1);
+        assert_eq!(verified_bytes, data.len() as u64);
     }
 
     #[test]
