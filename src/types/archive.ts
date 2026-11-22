@@ -8,12 +8,65 @@ export type CompressionMode =
   | "Ultra"
   | "Automatic";
 
+export type NavSection =
+  | "dashboard"
+  | "create"
+  | "extract"
+  | "explorer"
+  | "compression-settings"
+  | "performance"
+  | "benchmark"
+  | "settings"
+  | "about";
+
 export interface HardwareProfile {
   logical_cores: number;
   total_memory_mb: number;
   available_memory_mb: number;
   recommended_threads: number;
   max_safe_memory_arena_mb: number;
+}
+
+export interface DiskTelemetry {
+  mount_point: string;
+  name: string;
+  file_system: string;
+  total_gb: number;
+  available_gb: number;
+  used_percent: number;
+}
+
+export interface RecentArchive {
+  name: string;
+  path: string;
+  format: ArchiveFormat;
+  size_bytes: number;
+  last_opened_utc: string;
+}
+
+export interface RecentOperation {
+  id: string;
+  operation_type: string;
+  target_name: string;
+  format: ArchiveFormat;
+  mode: CompressionMode;
+  throughput_mb_s: number;
+  compression_ratio_percent: number;
+  duration_ms: number;
+  status: string;
+}
+
+export interface UserConfig {
+  theme: "dark" | "light";
+  default_format: ArchiveFormat;
+  default_mode: CompressionMode;
+  worker_threads: number;
+  memory_arena_mb: number;
+  enable_fastcdc_dedup: boolean;
+  enable_entropy_bypass: boolean;
+  enable_kinetic_shield_parity: boolean;
+  verify_integrity_on_complete: boolean;
+  overwrite_policy: string;
 }
 
 export interface FormatCapability {
@@ -34,7 +87,11 @@ export interface EngineStatusPayload {
   engine_version: string;
   default_format: ArchiveFormat;
   default_mode: CompressionMode;
+  config: UserConfig;
   hardware: HardwareProfile;
+  disks: DiskTelemetry[];
+  recent_archives: RecentArchive[];
+  recent_operations: RecentOperation[];
   supported_formats: FormatCapability[];
   compression_modes: ModeCapability[];
 }

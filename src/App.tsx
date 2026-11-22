@@ -1,91 +1,136 @@
 import React, { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { EngineStatusPayload } from "./types/archive";
+import {
+  EngineStatusPayload,
+  NavSection,
+  UserConfig,
+} from "./types/archive";
+import { Sidebar } from "./components/Sidebar";
+import { Dashboard } from "./components/Dashboard";
+import { SettingsView } from "./components/SettingsView";
+import { AboutView } from "./components/AboutView";
+import { SectionWorkspace } from "./components/SectionPlaceholders";
+
+const SECTION_TITLES: Record<NavSection, string> = {
+  dashboard: "Home / Dashboard",
+  create: "Create Archive",
+  extract: "Extract Archive",
+  explorer: "Archive Explorer",
+  "compression-settings": "Compression Settings",
+  performance: "Performance Monitor",
+  benchmark: "Benchmark Center",
+  settings: "Application Settings",
+  about: "About Kinetic",
+};
 
 export const App: React.FC = () => {
   const [status, setStatus] = useState<EngineStatusPayload | null>(null);
+  const [activeSection, setActiveSection] = useState<NavSection>("dashboard");
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<EngineStatusPayload>("get_engine_status")
-      .then((payload) => setStatus(payload))
+      .then((payload) => {
+        setStatus(payload);
+        const initialTheme = payload.config.theme === "light" ? "light" : "dark";
+        setTheme(initialTheme);
+        document.documentElement.setAttribute("data-theme", initialTheme);
+      })
       .catch((err) => setError(String(err)));
   }, []);
 
+  const handleSaveConfig = async (newConfig: UserConfig) => {
+    try {
+      const updated = await invoke<EngineStatusPayload>("update_user_config", {
+        newConfig,
+      });
+      setStatus(updated);
+      const nextTheme = updated.config.theme === "light" ? "light" : "dark";
+      setTheme(nextTheme);
+      document.documentElement.setAttribute("data-theme", nextTheme);
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  const handleToggleTheme = async () => {
+    const nextTheme = theme === "dark" ? "light" : "dark";
+    setTheme(nextTheme);
+    document.documentElement.setAttribute("data-theme", nextTheme);
+    if (status) {
+      await handleSaveConfig({ ...status.config, theme: nextTheme });
+    }
+  };
+
+  const handleClearHistory = async () => {
+    try {
+      const updated = await invoke<EngineStatusPayload>("clear_recent_history");
+      setStatus(updated);
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
   return (
-    <div className="shell-container">
-      <header className="shell-header">
-        <div>
-          <h1 style={{ fontSize: "1.35rem", fontWeight: 600 }}>
-            KINETIC — Advanced Compression & Archive Manager
-          </h1>
-          <p style={{ color: "var(--text-secondary)", fontSize: "0.85rem", marginTop: "4px" }}>
-            Phase 1 Foundation Shell • Native Rust Engine + Tauri 2 IPC Bridge
-          </p>
-        </div>
-        <span className="badge">
-          {status ? `${status.engine_name} v${status.engine_version}` : "Connecting Engine..."}
-        </span>
-      </header>
+    <div className="app-layout">
+      <Sidebar
+        activeSection={activeSection}
+        onSelectSection={setActiveSection}
+        theme={theme}
+        onToggleTheme={handleToggleTheme}
+        engineVersion={status ? status.engine_version : "0.2.0"}
+      />
 
-      {error && (
-        <div className="shell-card" style={{ borderColor: "#ef4444" }}>
-          <h3>IPC Diagnostic Notice</h3>
-          <p>{error}</p>
-        </div>
-      )}
-
-      {status && (
-        <div className="shell-grid">
-          <div className="shell-card">
-            <h3>Hardware Telemetry Profile</h3>
-            <div className="metric-row">
-              <span>Logical CPU Cores</span>
-              <strong>{status.hardware.logical_cores} Cores</strong>
-            </div>
-            <div className="metric-row">
-              <span>Worker Thread Pool</span>
-              <strong>{status.hardware.recommended_threads} Threads</strong>
-            </div>
-            <div className="metric-row">
-              <span>Total System Memory</span>
-              <strong>{status.hardware.total_memory_mb} MB</strong>
-            </div>
-            <div className="metric-row">
-              <span>Bounded Memory Arena Cap</span>
-              <strong>{status.hardware.max_safe_memory_arena_mb} MB</strong>
-            </div>
+      <main className="main-workspace">
+        <header className="topbar">
+          <div className="topbar-title">{SECTION_TITLES[activeSection]}</div>
+          <div className="topbar-meta">
+            {status && (
+              <>
+                <span className="badge">
+                  Default: <strong>{status.default_format}</strong> (
+                  {status.supported_formats.find((f) => f.format === status.default_format)?.extension})
+                </span>
+                <span className="badge badge-accent">
+                  Mode: <strong>{status.default_mode}</strong>
+                </span>
+                <span className="badge badge-success">
+                  {status.config.worker_threads} Threads Active
+                </span>
+              </>
+            )}
           </div>
+        </header>
 
-          <div className="shell-card">
-            <h3>Archive Format Matrix (Default: {status.default_format})</h3>
-            {status.supported_formats.map((f) => (
-              <div className="metric-row" key={f.format}>
-                <span>
-                  <strong>{f.format}</strong> ({f.extension})
-                </span>
-                <span>
-                  {f.can_create ? "Create / Extract" : "Extract & Browse Only"}
-                </span>
-              </div>
-            ))}
-          </div>
+        <div className="workspace-scroll">
+          {error && (
+            <div className="card" style={{ borderColor: "var(--status-danger)" }}>
+              <strong>Engine IPC Notice:</strong> {error}
+            </div>
+          )}
 
-          <div className="shell-card">
-            <h3>Kinetic Engine Compression Modes</h3>
-            {status.compression_modes.map((m) => (
-              <div className="metric-row" key={m.mode}>
-                <span>
-                  <strong>{m.mode}</strong> ({Math.round(m.target_block_size_bytes / (1024 * 1024))} MB Block)
-                </span>
-                <span style={{ color: "var(--text-secondary)", fontSize: "0.8rem" }}>
-                  {m.mode === status.default_mode ? "Default" : "Ready"}
-                </span>
-              </div>
-            ))}
-          </div>
+          {!status ? (
+            <div className="card">Initializing Kinetic Engine telemetry...</div>
+          ) : activeSection === "dashboard" ? (
+            <Dashboard
+              status={status}
+              onNavigate={setActiveSection}
+              onClearHistory={handleClearHistory}
+            />
+          ) : activeSection === "compression-settings" || activeSection === "settings" ? (
+            <SettingsView
+              status={status}
+              sectionType={activeSection}
+              onSaveConfig={handleSaveConfig}
+            />
+          ) : activeSection === "about" ? (
+            <AboutView status={status} />
+          ) : (
+            <SectionWorkspace section={activeSection} status={status} />
+          )}
         </div>
-      )}
+      </main>
     </div>
   );
 };

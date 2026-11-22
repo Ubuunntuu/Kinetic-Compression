@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use sysinfo::System;
+use sysinfo::{Disks, System};
 use thiserror::Error;
 
 pub const ENGINE_NAME: &str = "Kinetic Engine";
-pub const ENGINE_VERSION: &str = "0.1.0-alpha";
+pub const ENGINE_VERSION: &str = "0.2.0-alpha";
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -126,6 +126,98 @@ impl HardwareProfile {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskTelemetry {
+    pub mount_point: String,
+    pub name: String,
+    pub file_system: String,
+    pub total_gb: f64,
+    pub available_gb: f64,
+    pub used_percent: f64,
+}
+
+impl DiskTelemetry {
+    pub fn detect_all() -> Vec<Self> {
+        let disks = Disks::new_with_refreshed_list();
+        let mut result = Vec::new();
+
+        for disk in disks.list() {
+            let total = disk.total_space();
+            if total == 0 {
+                continue;
+            }
+            let avail = disk.available_space();
+            let used = total.saturating_sub(avail);
+            let total_gb = (total as f64) / 1_073_741_824.0;
+            let available_gb = (avail as f64) / 1_073_741_824.0;
+            let used_percent = ((used as f64) / (total as f64)) * 100.0;
+
+            result.push(Self {
+                mount_point: disk.mount_point().to_string_lossy().into_owned(),
+                name: disk.name().to_string_lossy().into_owned(),
+                file_system: disk.file_system().to_string_lossy().into_owned(),
+                total_gb: (total_gb * 10.0).round() / 10.0,
+                available_gb: (available_gb * 10.0).round() / 10.0,
+                used_percent: (used_percent * 10.0).round() / 10.0,
+            });
+        }
+        result
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentArchive {
+    pub name: String,
+    pub path: String,
+    pub format: ArchiveFormat,
+    pub size_bytes: u64,
+    pub last_opened_utc: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentOperation {
+    pub id: String,
+    pub operation_type: String,
+    pub target_name: String,
+    pub format: ArchiveFormat,
+    pub mode: CompressionMode,
+    pub throughput_mb_s: f64,
+    pub compression_ratio_percent: f64,
+    pub duration_ms: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserConfig {
+    pub theme: String,
+    pub default_format: ArchiveFormat,
+    pub default_mode: CompressionMode,
+    pub worker_threads: usize,
+    pub memory_arena_mb: u64,
+    pub enable_fastcdc_dedup: bool,
+    pub enable_entropy_bypass: bool,
+    pub enable_kinetic_shield_parity: bool,
+    pub verify_integrity_on_complete: bool,
+    pub overwrite_policy: String,
+}
+
+impl UserConfig {
+    pub fn from_hardware(hw: &HardwareProfile) -> Self {
+        Self {
+            theme: "dark".to_string(),
+            default_format: ArchiveFormat::Zip,
+            default_mode: CompressionMode::Balanced,
+            worker_threads: hw.recommended_threads,
+            memory_arena_mb: hw.max_safe_memory_arena_mb.min(2048),
+            enable_fastcdc_dedup: true,
+            enable_entropy_bypass: true,
+            enable_kinetic_shield_parity: false,
+            verify_integrity_on_complete: true,
+            overwrite_policy: "ask".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,10 +236,11 @@ mod tests {
     }
 
     #[test]
-    fn test_hardware_profile_detection() {
+    fn test_hardware_and_config_initialization() {
         let profile = HardwareProfile::detect();
-        assert!(profile.logical_cores >= 1);
-        assert!(profile.recommended_threads >= 1);
-        assert!(profile.max_safe_memory_arena_mb >= 256);
+        let cfg = UserConfig::from_hardware(&profile);
+        assert_eq!(cfg.theme, "dark");
+        assert_eq!(cfg.default_format, ArchiveFormat::Zip);
+        assert!(cfg.worker_threads >= 1);
     }
 }

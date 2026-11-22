@@ -1,5 +1,6 @@
 use kinetic_core::{
-    ArchiveFormat, CompressionMode, HardwareProfile, ENGINE_NAME, ENGINE_VERSION,
+    ArchiveFormat, CompressionMode, DiskTelemetry, HardwareProfile, RecentArchive,
+    RecentOperation, UserConfig, ENGINE_NAME, ENGINE_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -26,7 +27,11 @@ pub struct EngineStatusPayload {
     pub engine_version: &'static str,
     pub default_format: ArchiveFormat,
     pub default_mode: CompressionMode,
+    pub config: UserConfig,
     pub hardware: HardwareProfile,
+    pub disks: Vec<DiskTelemetry>,
+    pub recent_archives: Vec<RecentArchive>,
+    pub recent_operations: Vec<RecentOperation>,
     pub supported_formats: Vec<FormatCapability>,
     pub compression_modes: Vec<ModeCapability>,
 }
@@ -63,12 +68,20 @@ pub fn build_engine_status(state: &AppState) -> EngineStatusPayload {
     })
     .collect();
 
+    let config = state.config.lock().unwrap().clone();
+    let recent_archives = state.recent_archives.lock().unwrap().clone();
+    let recent_operations = state.recent_operations.lock().unwrap().clone();
+
     EngineStatusPayload {
         engine_name: ENGINE_NAME,
         engine_version: ENGINE_VERSION,
-        default_format: *state.default_format.lock().unwrap(),
-        default_mode: *state.default_mode.lock().unwrap(),
+        default_format: config.default_format,
+        default_mode: config.default_mode,
+        config,
         hardware: state.hardware.clone(),
+        disks: DiskTelemetry::detect_all(),
+        recent_archives,
+        recent_operations,
         supported_formats: formats,
         compression_modes: modes,
     }
@@ -76,6 +89,27 @@ pub fn build_engine_status(state: &AppState) -> EngineStatusPayload {
 
 #[tauri::command]
 pub fn get_engine_status(state: State<'_, AppState>) -> EngineStatusPayload {
+    build_engine_status(&state)
+}
+
+#[tauri::command]
+pub fn update_user_config(
+    new_config: UserConfig,
+    state: State<'_, AppState>,
+) -> Result<EngineStatusPayload, String> {
+    if !new_config.default_format.can_create() {
+        return Err("RAR cannot be set as the default creation format due to licensing restrictions.".to_string());
+    }
+    let mut cfg = state.config.lock().unwrap();
+    *cfg = new_config;
+    drop(cfg);
+    Ok(build_engine_status(&state))
+}
+
+#[tauri::command]
+pub fn clear_recent_history(state: State<'_, AppState>) -> EngineStatusPayload {
+    state.recent_archives.lock().unwrap().clear();
+    state.recent_operations.lock().unwrap().clear();
     build_engine_status(&state)
 }
 
@@ -91,5 +125,6 @@ mod tests {
         assert_eq!(status.default_mode, CompressionMode::Balanced);
         assert_eq!(status.supported_formats.len(), 4);
         assert_eq!(status.compression_modes.len(), 6);
+        assert_eq!(status.config.theme, "dark");
     }
 }
