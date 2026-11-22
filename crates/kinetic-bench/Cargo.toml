@@ -1,0 +1,10 @@
+﻿[package]
+name = "kinetic-bench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kinetic-core = { path = "../kinetic-core" }
+kinetic-format = { path = "../kinetic-format" }
+kinetic-compat = { path = "../kinetic-compat" }
+serde_json.workspace = true
