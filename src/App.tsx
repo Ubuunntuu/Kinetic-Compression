@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   EngineStatusPayload,
@@ -29,16 +29,21 @@ export const App: React.FC = () => {
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const refreshStatus = useCallback(() => {
     invoke<EngineStatusPayload>("get_engine_status")
       .then((payload) => {
         setStatus(payload);
-        const initialTheme = payload.config.theme === "light" ? "light" : "dark";
+        const initialTheme =
+          payload.config.theme === "light" ? "light" : "dark";
         setTheme(initialTheme);
         document.documentElement.setAttribute("data-theme", initialTheme);
       })
       .catch((err) => setError(String(err)));
   }, []);
+
+  useEffect(() => {
+    refreshStatus();
+  }, [refreshStatus]);
 
   const handleSaveConfig = async (newConfig: UserConfig) => {
     try {
@@ -90,7 +95,12 @@ export const App: React.FC = () => {
               <>
                 <span className="badge">
                   Default: <strong>{status.default_format}</strong> (
-                  {status.supported_formats.find((f) => f.format === status.default_format)?.extension})
+                  {
+                    status.supported_formats.find(
+                      (f) => f.format === status.default_format
+                    )?.extension
+                  }
+                  )
                 </span>
                 <span className="badge badge-accent">
                   Mode: <strong>{status.default_mode}</strong>
@@ -105,7 +115,10 @@ export const App: React.FC = () => {
 
         <div className="workspace-scroll">
           {error && (
-            <div className="card" style={{ borderColor: "var(--status-danger)" }}>
+            <div
+              className="card"
+              style={{ borderColor: "var(--status-danger)" }}
+            >
               <strong>Engine IPC Notice:</strong> {error}
             </div>
           )}
@@ -118,7 +131,8 @@ export const App: React.FC = () => {
               onNavigate={setActiveSection}
               onClearHistory={handleClearHistory}
             />
-          ) : activeSection === "compression-settings" || activeSection === "settings" ? (
+          ) : activeSection === "compression-settings" ||
+            activeSection === "settings" ? (
             <SettingsView
               status={status}
               sectionType={activeSection}
@@ -127,7 +141,11 @@ export const App: React.FC = () => {
           ) : activeSection === "about" ? (
             <AboutView status={status} />
           ) : (
-            <SectionWorkspace section={activeSection} status={status} />
+            <SectionWorkspace
+              section={activeSection}
+              status={status}
+              onRefreshStatus={refreshStatus}
+            />
           )}
         </div>
       </main>

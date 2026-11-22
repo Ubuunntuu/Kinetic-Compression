@@ -11,3 +11,10 @@ kinetic-core = { path = "../kinetic-core" }
 kinetic-format = { path = "../kinetic-format" }
 serde.workspace = true
 thiserror.workspace = true
+crc32fast.workspace = true
+walkdir.workspace = true
+zip.workspace = true
+sevenz-rust.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

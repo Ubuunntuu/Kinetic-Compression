@@ -82,6 +82,43 @@ export interface ModeCapability {
   description: string;
 }
 
+export interface ArchiveEntry {
+  path: string;
+  is_dir: boolean;
+  uncompressed_size: number;
+  compressed_size: number;
+  modified_unix_secs: number;
+  checksum_hex: string | null;
+  codec_name: string;
+}
+
+export interface ArchiveInspection {
+  path: string;
+  format: ArchiveFormat;
+  archive_size_bytes: number;
+  total_entries: number;
+  total_uncompressed_bytes: number;
+  entries: ArchiveEntry[];
+}
+
+export interface IntegrityReport {
+  valid: boolean;
+  verified_entries: number;
+  total_uncompressed_bytes: number;
+  message: string;
+}
+
+export interface OperationResult {
+  success: boolean;
+  message: string;
+  archive_path: string;
+  processed_bytes: number;
+  compressed_bytes: number;
+  duration_ms: number;
+  throughput_mb_s: number;
+  compression_ratio_percent: number;
+}
+
 export interface EngineStatusPayload {
   engine_name: string;
   engine_version: string;
