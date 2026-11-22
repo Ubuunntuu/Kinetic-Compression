@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
-use kinetic_compat::{create_archive, extract_archive};
+use kinetic_compat::{create_archive_with_options, extract_archive};
 use kinetic_core::memory::MemoryArena;
 use kinetic_core::pipeline::{compress_stream_parallel, decompress_blocks_parallel};
 use kinetic_core::progress::JobController;
@@ -236,7 +236,7 @@ pub fn run_full_benchmark_suite(
             let _ = fs::remove_dir_all(&extract_dir);
 
             let t0 = Instant::now();
-            create_archive(&[dataset_path.clone()], &archive_file, fmt, mode)
+            create_archive_with_options(&[dataset_path.clone()], &archive_file, fmt, mode, None, true, true, false)
                 .map_err(|e| e.to_string())?;
             let compress_ms = t0.elapsed().as_millis().max(1) as u64;
             let comp_bytes = fs::metadata(&archive_file).map(|m| m.len()).unwrap_or(0);

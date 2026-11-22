@@ -95,6 +95,10 @@ pub struct KineticFileEntry {
     pub blake3_hex: String,
     pub codec_summary: String,
     pub block_ids: Vec<u32>,
+    #[serde(default)]
+    pub solid_offset: u64,
+    #[serde(default)]
+    pub is_solid_slice: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,7 +138,6 @@ impl Default for KineticWriteOptions {
     }
 }
 
-/// Optimized page-aligned buffered file reader that pre-allocates exact capacity to avoid vector reallocations.
 pub fn read_file_page_aligned(path: &Path) -> io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
@@ -417,6 +420,9 @@ pub fn create_kinetic_archive(
             ext_a.cmp(ext_b).then_with(|| a.1.cmp(&b.1))
         });
 
+        let non_dir_count = files_to_pack.iter().filter(|(_, _, is_dir)| !*is_dir).count();
+        let use_micro_solid_clustering = non_dir_count > 8;
+
         let mut dict_samples: Vec<Vec<u8>> = Vec::new();
         for (disk_path, _, is_dir) in files_to_pack.iter().take(32) {
             if !*is_dir {
@@ -456,6 +462,12 @@ pub fn create_kinetic_archive(
         let mut total_input_bytes = 0u64;
         let mut archive_hasher = blake3::Hasher::new();
 
+        // Micro-Solid cluster accumulator for small files (<= 64 KB) when archive has > 8 files
+        let mut solid_buffer: Vec<u8> = Vec::new();
+        let mut solid_label_hint = String::from("micro_solid.txt");
+        let mut current_solid_block_id: Option<u32> = None;
+        const MICRO_SOLID_CAP: usize = 4 * 1024 * 1024; // 4 MB micro-solid cluster
+
         for (disk_path, rel_path, is_dir) in files_to_pack {
             let mtime = file_modified_unix_secs(&disk_path);
             if is_dir {
@@ -468,6 +480,8 @@ pub fn create_kinetic_archive(
                     blake3_hex: String::new(),
                     codec_summary: "Directory".to_string(),
                     block_ids: Vec::new(),
+                    solid_offset: 0,
+                    is_solid_slice: false,
                 });
                 continue;
             }
@@ -478,6 +492,56 @@ pub fn create_kinetic_archive(
             archive_hasher.update(&raw_data);
 
             let file_blake3 = blake3::hash(&raw_data).to_hex().to_string();
+
+            // Pack small files into 4 MB Micro-Solid Clusters for cross-file compression & 1-seek extraction
+            if use_micro_solid_clustering && raw_data.len() <= 64 * 1024 {
+                if !solid_buffer.is_empty() && solid_buffer.len() + raw_data.len() > MICRO_SOLID_CAP {
+                    if let Some(s_bid) = current_solid_block_id.take() {
+                        pending_blocks.push(PendingUniqueBlock {
+                            block_id: s_bid,
+                            rel_path: solid_label_hint.clone(),
+                            raw_bytes: std::mem::take(&mut solid_buffer),
+                        });
+                    }
+                }
+
+                let s_bid = match current_solid_block_id {
+                    Some(id) => id,
+                    None => {
+                        let new_id = pending_blocks.len() as u32;
+                        current_solid_block_id = Some(new_id);
+                        solid_label_hint = rel_path.clone();
+                        new_id
+                    }
+                };
+
+                let solid_offset = solid_buffer.len() as u64;
+                solid_buffer.extend_from_slice(&raw_data);
+
+                file_entries.push(KineticFileEntry {
+                    path: rel_path,
+                    is_dir: false,
+                    uncompressed_size: file_len,
+                    compressed_size: 0,
+                    modified_unix_secs: mtime,
+                    blake3_hex: file_blake3,
+                    codec_summary: "Micro-Solid".to_string(),
+                    block_ids: vec![s_bid],
+                    solid_offset,
+                    is_solid_slice: true,
+                });
+                continue;
+            }
+
+            // Flush any open micro-solid cluster before reserving a new normal block ID
+            if let Some(s_bid) = current_solid_block_id.take() {
+                pending_blocks.push(PendingUniqueBlock {
+                    block_id: s_bid,
+                    rel_path: solid_label_hint.clone(),
+                    raw_bytes: std::mem::take(&mut solid_buffer),
+                });
+            }
+
             let chunks = chunk_slice_fastcdc(&raw_data, options.enable_fastcdc_dedup);
             let mut file_block_ids = Vec::with_capacity(chunks.len());
 
@@ -513,6 +577,16 @@ pub fn create_kinetic_archive(
                 blake3_hex: file_blake3,
                 codec_summary: "Pending".to_string(),
                 block_ids: file_block_ids,
+                solid_offset: 0,
+                is_solid_slice: false,
+            });
+        }
+
+        if let Some(s_bid) = current_solid_block_id.take() {
+            pending_blocks.push(PendingUniqueBlock {
+                block_id: s_bid,
+                rel_path: solid_label_hint,
+                raw_bytes: solid_buffer,
             });
         }
 
@@ -652,8 +726,15 @@ pub fn create_kinetic_archive(
             let mut label = "Store".to_string();
             for &bid in &entry.block_ids {
                 if let Some(desc) = block_descriptors.get(bid as usize) {
-                    sum_comp += desc.compressed_size;
-                    label = codec_name(desc.codec_id, desc.filter_mask);
+                    if entry.is_solid_slice && desc.uncompressed_size > 0 {
+                        sum_comp += ((desc.compressed_size as f64)
+                            * ((entry.uncompressed_size as f64) / (desc.uncompressed_size as f64)))
+                            as u64;
+                        label = format!("Solid-{}", codec_name(desc.codec_id, desc.filter_mask));
+                    } else {
+                        sum_comp += desc.compressed_size;
+                        label = codec_name(desc.codec_id, desc.filter_mask);
+                    }
                 }
             }
             entry.compressed_size = sum_comp;
@@ -724,7 +805,6 @@ pub fn create_kinetic_archive(
     }
 }
 
-/// Splits an archive file into numbered multipart volumes (`.001`, `.002`, ...) of `max_volume_bytes`.
 pub fn split_archive_into_volumes(
     archive_path: &Path,
     max_volume_bytes: u64,
@@ -747,7 +827,6 @@ pub fn split_archive_into_volumes(
     Ok(parts)
 }
 
-/// Reassembles numbered multipart volumes (`.001`, `.002`, ...) back into a single archive file.
 pub fn reassemble_multipart_volumes(
     first_volume_path: &Path,
     output_archive_path: &Path,
@@ -916,6 +995,8 @@ pub fn append_files_to_kinetic_archive(
             blake3_hex: file_blake3,
             codec_summary: codec_name(codec_id, filter_mask),
             block_ids: vec![block_id],
+            solid_offset: 0,
+            is_solid_slice: false,
         });
         added_files += 1;
     }
@@ -1030,11 +1111,15 @@ pub fn read_and_verify_block(
     parity_length: u64,
     crypto_key: Option<&([u8; NONCE_LEN], [u8; 32])>,
 ) -> Result<Vec<u8>, FormatError> {
-    let mut header_buf = [0u8; GLOBAL_HEADER_SIZE];
-    file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut header_buf)?;
-    let header = GlobalHeader::from_bytes(&header_buf)?;
-    let seed_dict = load_seed_dictionary(file, &header, crypto_key)?;
+    let seed_dict = if (desc.filter_mask & FILTER_SHARED_DICT) != 0 {
+        let mut header_buf = [0u8; GLOBAL_HEADER_SIZE];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut header_buf)?;
+        let header = GlobalHeader::from_bytes(&header_buf)?;
+        load_seed_dictionary(file, &header, crypto_key)?
+    } else {
+        Vec::new()
+    };
 
     file.seek(SeekFrom::Start(desc.file_offset))?;
     let mut frame_buf = [0u8; BLOCK_HEADER_SIZE];
@@ -1130,12 +1215,31 @@ pub fn validate_kinetic_archive(
             continue;
         }
         let mut file_hasher = blake3::Hasher::new();
-        for &bid in &entry.block_ids {
-            let chunk = decoded_blocks.get(&bid).ok_or_else(|| {
+        if entry.is_solid_slice {
+            let bid = *entry.block_ids.first().ok_or_else(|| {
+                FormatError::CorruptedBlock("Missing solid block ID".to_string())
+            })?;
+            let solid_block = decoded_blocks.get(&bid).ok_or_else(|| {
                 FormatError::CorruptedBlock(format!("Missing block ID {} in archive", bid))
             })?;
-            file_hasher.update(chunk);
-            total_uncompressed += chunk.len() as u64;
+            let start = entry.solid_offset as usize;
+            let end = start + (entry.uncompressed_size as usize);
+            if end > solid_block.len() {
+                return Err(FormatError::CorruptedBlock(
+                    "Solid slice out of bounds".to_string(),
+                ));
+            }
+            let slice = &solid_block[start..end];
+            file_hasher.update(slice);
+            total_uncompressed += slice.len() as u64;
+        } else {
+            for &bid in &entry.block_ids {
+                let chunk = decoded_blocks.get(&bid).ok_or_else(|| {
+                    FormatError::CorruptedBlock(format!("Missing block ID {} in archive", bid))
+                })?;
+                file_hasher.update(chunk);
+                total_uncompressed += chunk.len() as u64;
+            }
         }
         let actual_hex = file_hasher.finalize().to_hex().to_string();
         if actual_hex != entry.blake3_hex {
@@ -1294,7 +1398,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let file1 = dir.path().join("alpha.txt");
         let file2 = dir.path().join("beta_duplicate.txt");
-        let payload = b"Kinetic Phase 8.5 Multithreaded Writer + FastCDC Deduplication Payload! ".repeat(2048);
+        let payload = b"Kinetic Phase 9B Multithreaded Writer + FastCDC Deduplication Payload! ".repeat(2048);
         fs::write(&file1, &payload).unwrap();
         fs::write(&file2, &payload).unwrap();
 

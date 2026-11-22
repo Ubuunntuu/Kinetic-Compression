@@ -736,14 +736,34 @@ pub fn extract_selected_entries(
                     let mut bounded = BoundedExtractionWriter::new(out_file, max_entry_stream);
                     let mut file_hasher = blake3::Hasher::new();
 
-                    for &bid in &entry.block_ids {
-                        let chunk = block_cache.get(&bid).ok_or_else(|| {
+                    if entry.is_solid_slice {
+                        let bid = *entry.block_ids.first().ok_or_else(|| {
+                            CompatError::Format("Missing solid block ID".to_string())
+                        })?;
+                        let solid_block = block_cache.get(&bid).ok_or_else(|| {
                             CompatError::Format(format!("Missing block ID {}", bid))
                         })?;
-                        file_hasher.update(chunk);
-                        if let Err(e) = bounded.write_all(chunk) {
+                        let start = entry.solid_offset as usize;
+                        let end = start + (entry.uncompressed_size as usize);
+                        if end > solid_block.len() {
+                            return Err(CompatError::Format("Solid slice out of bounds".to_string()));
+                        }
+                        let slice = &solid_block[start..end];
+                        file_hasher.update(slice);
+                        if let Err(e) = bounded.write_all(slice) {
                             let _ = fs::remove_file(&target_path);
                             return Err(CompatError::Io(e));
+                        }
+                    } else {
+                        for &bid in &entry.block_ids {
+                            let chunk = block_cache.get(&bid).ok_or_else(|| {
+                                CompatError::Format(format!("Missing block ID {}", bid))
+                            })?;
+                            file_hasher.update(chunk);
+                            if let Err(e) = bounded.write_all(chunk) {
+                                let _ = fs::remove_file(&target_path);
+                                return Err(CompatError::Io(e));
+                            }
                         }
                     }
                     bounded.flush()?;
