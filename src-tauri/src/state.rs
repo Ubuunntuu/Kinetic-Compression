@@ -24,6 +24,7 @@ pub struct AppState {
     pub hardware: HardwareProfile,
     pub arena: Arc<MemoryArena>,
     pub job_controller: Arc<JobController>,
+    pub startup_archive_path: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -68,6 +69,7 @@ impl Default for AppState {
             hardware,
             arena,
             job_controller,
+            startup_archive_path: Mutex::new(None),
         }
     }
 }

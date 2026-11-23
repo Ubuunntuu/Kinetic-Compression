@@ -43,6 +43,13 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     refreshStatus();
+    invoke<string | null>("get_startup_archive_cmd")
+      .then((startupPath) => {
+        if (startupPath) {
+          setActiveSection("explorer");
+        }
+      })
+      .catch(() => {});
   }, [refreshStatus]);
 
   const handleSaveConfig = async (newConfig: UserConfig) => {

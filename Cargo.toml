@@ -21,6 +21,7 @@ thiserror = "1.0"
 crc32fast = "1.4"
 sysinfo = "0.30"
 walkdir = "2.5"
+filetime = "0.2"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 sevenz-rust = "0.6"
 tempfile = "3.10"

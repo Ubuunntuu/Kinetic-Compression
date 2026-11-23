@@ -65,6 +65,16 @@ export const ArchiveExplorer: React.FC<ArchiveExplorerProps> = ({
   } | null>(null);
 
   useEffect(() => {
+    invoke<string | null>("get_startup_archive_cmd")
+      .then((startupPath) => {
+        if (startupPath) {
+          setArchivePath(startupPath);
+          loadArchive(startupPath);
+        }
+      })
+      .catch(() => {});
+  }, []);
+  useEffect(() => {
     const closeMenu = () => setContextMenu(null);
     window.addEventListener("click", closeMenu);
     return () => window.removeEventListener("click", closeMenu);

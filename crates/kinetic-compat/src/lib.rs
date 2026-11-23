@@ -23,7 +23,7 @@ use thiserror::Error;
 use zip::ZipArchive;
 
 use crate::security::{
-    resolve_extraction_target, sanitize_relative_path, verify_decompression_quota,
+    resolve_extraction_target, sanitize_relative_path, verify_decompression_quota, verify_destination_disk_space,
     BoundedExtractionWriter, SecurityError, DEFAULT_MAX_EXTRACTION_BYTES,
 };
 
@@ -737,6 +737,7 @@ pub fn extract_selected_entries(
                 }
             }
 
+            verify_destination_disk_space(destination, cumulative_bytes)?;
             // Pre-create all unique target directories once to eliminate redundant NTFS syscalls
             for dir_path in unique_dirs {
                 fs::create_dir_all(&dir_path)?;

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use kinetic_compat::{create_archive, extract_archive};
+use kinetic_compat::{create_archive, extract_archive, inspect_archive, repair_archive, validate_archive};
 use kinetic_core::{ArchiveFormat, CompressionMode};
 use serde::{Deserialize, Serialize};
 
@@ -12,32 +12,31 @@ pub struct ShellIntegrationStatus {
     pub message: String,
 }
 
-fn reg_add_key(key: &str, value_name: Option<&str>, data: &str) -> Result<(), String> {
-    let mut cmd = Command::new("reg");
-    cmd.arg("add").arg(key);
-    match value_name {
-        Some(v) => {
-            cmd.arg("/v").arg(v);
+/// Uses PowerShell's native Registry provider to write keys cleanly without reg.exe quote-stripping bugs.
+fn ps_set_registry_default(reg_path: &str, value: &str, icon: Option<&str>) -> Result<(), String> {
+    let escaped_val = value.replace('\'', "''");
+    let icon_stmt = match icon {
+        Some(ic) => {
+            let escaped_ic = ic.replace('\'', "''");
+            format!("; Set-ItemProperty -LiteralPath '{}' -Name 'Icon' -Value '{}'", reg_path, escaped_ic)
         }
-        None => {
-            cmd.arg("/ve");
-        }
-    }
-    cmd.args(["/t", "REG_SZ", "/d", data, "/f"]);
+        None => String::new(),
+    };
 
-    let output = cmd.output().map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(format!(
-            "Registry update failed for {}: {}",
-            key,
-            String::from_utf8_lossy(&output.stderr)
-        ));
+    let script = format!(
+        "New-Item -Path '{}' -Force | Out-Null; Set-ItemProperty -LiteralPath '{}' -Name '(Default)' -Value '{}'{}",
+        reg_path, reg_path, escaped_val, icon_stmt
+    );
+
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
     }
     Ok(())
-}
-
-fn reg_delete_key(key: &str) {
-    let _ = Command::new("reg").args(["delete", key, "/f"]).output();
 }
 
 pub fn query_shell_status() -> ShellIntegrationStatus {
@@ -47,7 +46,7 @@ pub fn query_shell_status() -> ShellIntegrationStatus {
         .into_owned();
 
     let check = Command::new("reg")
-        .args(["query", r"HKCU\Software\Classes\*\shell\KineticCompressZip"])
+        .args(["query", r"HKCU\Software\Classes\*\shell\KineticCompressZip\command"])
         .output();
 
     let registered = check.map(|o| o.status.success()).unwrap_or(false);
@@ -61,12 +60,13 @@ pub fn query_shell_status() -> ShellIntegrationStatus {
                 "Kinetic: Compress to .kinetic".to_string(),
                 "Kinetic: Extract Here".to_string(),
                 "Kinetic: Extract to Subfolder".to_string(),
+                "Double-Click .kinetic File Association".to_string(),
             ]
         } else {
             Vec::new()
         },
         message: if registered {
-            "Windows Explorer right-click context menus are active under HKCU\\Software\\Classes.".to_string()
+            "Windows Explorer right-click context menus and .kinetic file association are active.".to_string()
         } else {
             "Context menus are not currently registered in Windows Explorer.".to_string()
         },
@@ -84,44 +84,58 @@ pub fn register_explorer_context_menus() -> Result<ShellIntegrationStatus, Strin
             .into_owned()
     };
 
-    let targets = [r"HKCU\Software\Classes\*\shell", r"HKCU\Software\Classes\Directory\shell"];
+    let targets = [r"HKCU:\Software\Classes\*\shell", r"HKCU:\Software\Classes\Directory\shell"];
 
     for base in targets {
         let zip_key = format!(r"{}\KineticCompressZip", base);
-        reg_add_key(&zip_key, None, "Kinetic: Compress to .zip")?;
-        reg_add_key(&zip_key, Some("Icon"), &exe_path)?;
-        reg_add_key(
+        ps_set_registry_default(&zip_key, "Kinetic: Compress to .zip", Some(&exe_path))?;
+        ps_set_registry_default(
             &format!(r"{}\command", zip_key),
-            None,
             &format!("\"{}\" --compress-zip \"%1\"", exe_path),
+            None,
         )?;
 
         let knt_key = format!(r"{}\KineticCompressNative", base);
-        reg_add_key(&knt_key, None, "Kinetic: Compress to .kinetic")?;
-        reg_add_key(&knt_key, Some("Icon"), &exe_path)?;
-        reg_add_key(
+        ps_set_registry_default(&knt_key, "Kinetic: Compress to .kinetic", Some(&exe_path))?;
+        ps_set_registry_default(
             &format!(r"{}\command", knt_key),
-            None,
             &format!("\"{}\" --compress-kinetic \"%1\"", exe_path),
+            None,
         )?;
     }
 
-    let ext_here_key = r"HKCU\Software\Classes\*\shell\KineticExtractHere";
-    reg_add_key(ext_here_key, None, "Kinetic: Extract Here")?;
-    reg_add_key(ext_here_key, Some("Icon"), &exe_path)?;
-    reg_add_key(
+    let ext_here_key = r"HKCU:\Software\Classes\*\shell\KineticExtractHere";
+    ps_set_registry_default(ext_here_key, "Kinetic: Extract Here", Some(&exe_path))?;
+    ps_set_registry_default(
         &format!(r"{}\command", ext_here_key),
-        None,
         &format!("\"{}\" --extract-here \"%1\"", exe_path),
+        None,
     )?;
 
-    let ext_sub_key = r"HKCU\Software\Classes\*\shell\KineticExtractSub";
-    reg_add_key(ext_sub_key, None, "Kinetic: Extract to Subfolder")?;
-    reg_add_key(ext_sub_key, Some("Icon"), &exe_path)?;
-    reg_add_key(
+    let ext_sub_key = r"HKCU:\Software\Classes\*\shell\KineticExtractSub";
+    ps_set_registry_default(ext_sub_key, "Kinetic: Extract to Subfolder", Some(&exe_path))?;
+    ps_set_registry_default(
         &format!(r"{}\command", ext_sub_key),
-        None,
         &format!("\"{}\" --extract-sub \"%1\"", exe_path),
+        None,
+    )?;
+
+    // Register .kinetic file extension for double-click opening in Archive Explorer
+    ps_set_registry_default(r"HKCU:\Software\Classes\.kinetic", "Kinetic.Archive.1", None)?;
+    ps_set_registry_default(
+        r"HKCU:\Software\Classes\Kinetic.Archive.1",
+        "Kinetic Native Archive (.kinetic)",
+        Some(&exe_path),
+    )?;
+    ps_set_registry_default(
+        r"HKCU:\Software\Classes\Kinetic.Archive.1\DefaultIcon",
+        &format!("\"{}\",0", exe_path),
+        None,
+    )?;
+    ps_set_registry_default(
+        r"HKCU:\Software\Classes\Kinetic.Archive.1\shell\open\command",
+        &format!("\"{}\" --open \"%1\"", exe_path),
+        None,
     )?;
 
     Ok(query_shell_status())
@@ -135,14 +149,44 @@ pub fn unregister_explorer_context_menus() -> Result<ShellIntegrationStatus, Str
         r"HKCU\Software\Classes\*\shell\KineticExtractSub",
         r"HKCU\Software\Classes\Directory\shell\KineticCompressZip",
         r"HKCU\Software\Classes\Directory\shell\KineticCompressNative",
+        r"HKCU\Software\Classes\.kinetic",
+        r"HKCU\Software\Classes\Kinetic.Archive.1",
     ];
     for k in keys {
-        reg_delete_key(k);
+        let _ = Command::new("reg").args(["delete", k, "/f"]).output();
     }
     Ok(query_shell_status())
 }
 
+/// Checks if the process was launched with `--open <archive>` or a bare archive path to open in the GUI.
+pub fn extract_startup_open_archive(args: &[String]) -> Option<String> {
+    if args.len() >= 3 && args[1] == "--open" {
+        return Some(args[2].clone());
+    }
+    if args.len() == 2 && !args[1].starts_with("--") {
+        let p = Path::new(&args[1]);
+        if p.exists() && p.is_file() {
+            return Some(args[1].clone());
+        }
+    }
+    None
+}
+
+/// Executes headless CLI commands (`--compress-zip`, `--compress-kinetic`, `--extract-here`, `--extract-sub`, `--list`, `--verify`, `--repair`, `--register-shell`).
 pub fn try_handle_cli_invocation(args: &[String]) -> Option<i32> {
+    if args.len() >= 2 && args[1] == "--register-shell" {
+        return match register_explorer_context_menus() {
+            Ok(st) => {
+                println!("{}", st.message);
+                Some(0)
+            }
+            Err(e) => {
+                eprintln!("Shell registration error: {}", e);
+                Some(1)
+            }
+        };
+    }
+
     if args.len() < 3 {
         return None;
     }
@@ -198,6 +242,45 @@ pub fn try_handle_cli_invocation(args: &[String]) -> Option<i32> {
                 }
             }
         }
+        "--list" => match inspect_archive(&target) {
+            Ok(info) => {
+                println!(
+                    "Archive: {} ({:?}, {} entries, {} bytes uncompressed)",
+                    info.path, info.format, info.total_entries, info.total_uncompressed_bytes
+                );
+                for entry in info.entries {
+                    println!(
+                        "  {:<48} | {:>10} B -> {:>10} B | {}",
+                        entry.path, entry.uncompressed_size, entry.compressed_size, entry.codec_name
+                    );
+                }
+                Some(0)
+            }
+            Err(e) => {
+                eprintln!("CLI List error: {}", e);
+                Some(1)
+            }
+        },
+        "--verify" => match validate_archive(&target) {
+            Ok(rep) => {
+                println!("VERIFY PASSED: {}", rep.message);
+                Some(0)
+            }
+            Err(e) => {
+                eprintln!("VERIFY FAILED: {}", e);
+                Some(1)
+            }
+        },
+        "--repair" => match repair_archive(&target, None) {
+            Ok(rep) => {
+                println!("REPAIR COMPLETE: {}", rep.message);
+                Some(0)
+            }
+            Err(e) => {
+                eprintln!("REPAIR FAILED: {}", e);
+                Some(1)
+            }
+        },
         _ => None,
     }
 }
@@ -259,6 +342,21 @@ mod tests {
         let created_knt = dir.path().join("explorer_click.kinetic");
         assert!(created_knt.exists());
 
+        // Test --list and --verify CLI commands
+        let args_list = vec![
+            "Kinetic.exe".to_string(),
+            "--list".to_string(),
+            created_knt.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(try_handle_cli_invocation(&args_list), Some(0));
+
+        let args_verify = vec![
+            "Kinetic.exe".to_string(),
+            "--verify".to_string(),
+            created_knt.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(try_handle_cli_invocation(&args_verify), Some(0));
+
         let args_ext = vec![
             "Kinetic.exe".to_string(),
             "--extract-sub".to_string(),
@@ -272,5 +370,18 @@ mod tests {
             .join("explorer_click.txt");
         assert!(extracted_file.exists());
         assert_eq!(std::fs::read(&extracted_file).unwrap(), payload);
+    }
+
+    #[test]
+    fn test_double_click_open_argument_detection() {
+        let args = vec![
+            "Kinetic.exe".to_string(),
+            "--open".to_string(),
+            r"C:\archives\backup.kinetic".to_string(),
+        ];
+        assert_eq!(
+            extract_startup_open_archive(&args),
+            Some(r"C:\archives\backup.kinetic".to_string())
+        );
     }
 }

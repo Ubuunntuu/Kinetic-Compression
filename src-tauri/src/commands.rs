@@ -722,6 +722,11 @@ pub fn register_shell_context_menu_cmd() -> Result<crate::shell::ShellIntegratio
 pub fn unregister_shell_context_menu_cmd() -> Result<crate::shell::ShellIntegrationStatus, String> {
     crate::shell::unregister_explorer_context_menus()
 }
+
+#[tauri::command]
+pub fn get_startup_archive_cmd(state: State<'_, AppState>) -> Option<String> {
+    state.startup_archive_path.lock().unwrap().take()
+}
 #[cfg(test)]
 mod tests {
     use super::*;

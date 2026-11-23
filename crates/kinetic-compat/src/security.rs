@@ -220,6 +220,33 @@ pub fn resolve_extraction_target(
     }
 }
 
+
+/// Pre-flight check ensuring the destination drive has enough free space before writing or extracting.
+pub fn verify_destination_disk_space(target_path: &Path, required_bytes: u64) -> Result<(), SecurityError> {
+    if required_bytes == 0 {
+        return Ok(());
+    }
+    let abs_target = std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let target_str = abs_target.to_string_lossy().to_uppercase();
+
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    for disk in disks.list() {
+        let mount = disk.mount_point().to_string_lossy().to_uppercase();
+        if !mount.is_empty() && target_str.starts_with(&mount) {
+            let avail = disk.available_space();
+            // Require a 16 MB safety reserve above the required extraction/archive size
+            let needed = required_bytes.saturating_add(16 * 1024 * 1024);
+            if avail < needed {
+                return Err(SecurityError::DecompressionBombQuotaExceeded {
+                    uncompressed: needed,
+                    limit: avail,
+                });
+            }
+            break;
+        }
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

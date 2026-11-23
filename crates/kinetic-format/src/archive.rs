@@ -454,6 +454,39 @@ pub fn create_kinetic_archive(
             (0, 0)
         };
 
+                // Pre-read small files in parallel across worker threads when packing > 16 files
+        let mut preloaded_files: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        if files_to_pack.len() > 16 {
+            let read_threads = options.worker_threads.max(1).min(8);
+            let (p_tx, p_rx) = bounded::<PathBuf>(read_threads * 4);
+            let (d_tx, d_rx) = unbounded::<(PathBuf, Vec<u8>)>();
+            let mut r_handles = Vec::with_capacity(read_threads);
+            for _ in 0..read_threads {
+                let rx = p_rx.clone();
+                let tx = d_tx.clone();
+                r_handles.push(thread::spawn(move || {
+                    while let Ok(p) = rx.recv() {
+                        if let Ok(bytes) = read_file_page_aligned(&p) {
+                            let _ = tx.send((p, bytes));
+                        }
+                    }
+                }));
+            }
+            drop(p_rx);
+            drop(d_tx);
+            for (disk_p, _, is_d) in &files_to_pack {
+                if !*is_d {
+                    let _ = p_tx.send(disk_p.clone());
+                }
+            }
+            drop(p_tx);
+            for (p, bytes) in d_rx {
+                preloaded_files.insert(p, bytes);
+            }
+            for h in r_handles {
+                let _ = h.join();
+            }
+        }
         let mut chunk_dedup_table: HashMap<[u8; 32], u32> = HashMap::new();
         let mut pending_blocks: Vec<PendingUniqueBlock> = Vec::new();
         let mut file_entries: Vec<KineticFileEntry> = Vec::new();
@@ -486,7 +519,7 @@ pub fn create_kinetic_archive(
                 continue;
             }
 
-            let raw_data = read_file_page_aligned(&disk_path)?;
+            let raw_data = match preloaded_files.remove(&disk_path) { Some(b) => b, None => read_file_page_aligned(&disk_path)? };
             let file_len = raw_data.len() as u64;
             total_input_bytes += file_len;
             archive_hasher.update(&raw_data);
