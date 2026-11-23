@@ -1,0 +1,16 @@
+{
+  "config": {
+    "theme": "dark",
+    "default_format": "Zip",
+    "default_mode": "Balanced",
+    "worker_threads": 7,
+    "memory_arena_mb": 2048,
+    "enable_fastcdc_dedup": true,
+    "enable_entropy_bypass": true,
+    "enable_kinetic_shield_parity": false,
+    "verify_integrity_on_complete": true,
+    "overwrite_policy": "ask"
+  },
+  "recent_archives": [],
+  "recent_operations": []
+}

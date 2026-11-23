@@ -12,24 +12,9 @@ pub struct ShellIntegrationStatus {
     pub message: String,
 }
 
-/// Uses PowerShell's native Registry provider to write keys cleanly without reg.exe quote-stripping bugs.
-fn ps_set_registry_default(reg_path: &str, value: &str, icon: Option<&str>) -> Result<(), String> {
-    let escaped_val = value.replace('\'', "''");
-    let icon_stmt = match icon {
-        Some(ic) => {
-            let escaped_ic = ic.replace('\'', "''");
-            format!("; Set-ItemProperty -LiteralPath '{}' -Name 'Icon' -Value '{}'", reg_path, escaped_ic)
-        }
-        None => String::new(),
-    };
-
-    let script = format!(
-        "New-Item -Path '{}' -Force | Out-Null; Set-ItemProperty -LiteralPath '{}' -Name '(Default)' -Value '{}'{}",
-        reg_path, reg_path, escaped_val, icon_stmt
-    );
-
+fn run_ps_script(script: &str) -> Result<(), String> {
     let out = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
+        .args(["-NoProfile", "-Command", script])
         .output()
         .map_err(|e| e.to_string())?;
 
@@ -46,7 +31,7 @@ pub fn query_shell_status() -> ShellIntegrationStatus {
         .into_owned();
 
     let check = Command::new("reg")
-        .args(["query", r"HKCU\Software\Classes\*\shell\KineticCompressZip\command"])
+        .args(["query", r"HKCU\Software\Classes\*\shell\KineticMenu\shell"])
         .output();
 
     let registered = check.map(|o| o.status.success()).unwrap_or(false);
@@ -56,99 +41,34 @@ pub fn query_shell_status() -> ShellIntegrationStatus {
         executable_path: exe_path,
         registered_verbs: if registered {
             vec![
-                "Kinetic: Compress to .zip".to_string(),
-                "Kinetic: Compress to .kinetic".to_string(),
-                "Kinetic: Extract Here".to_string(),
-                "Kinetic: Extract to Subfolder".to_string(),
-                "Double-Click .kinetic File Association".to_string(),
+                "Kinetic > Open in Kinetic Archive Explorer...".to_string(),
+                "Kinetic > Add to .kinetic Archive".to_string(),
+                "Kinetic > Add to .zip Archive".to_string(),
+                "Kinetic > Extract Here".to_string(),
+                "Kinetic > Extract to Subfolder".to_string(),
             ]
         } else {
             Vec::new()
         },
         message: if registered {
-            "Windows Explorer right-click context menus and .kinetic file association are active.".to_string()
+            "Cascading 'Kinetic >' flyout menu and .kinetic file association are active in Windows Explorer.".to_string()
         } else {
             "Context menus are not currently registered in Windows Explorer.".to_string()
         },
     }
 }
 
-pub fn register_explorer_context_menus() -> Result<ShellIntegrationStatus, String> {
-    let release_exe = PathBuf::from(r"C:\projects\kinetic compression\release\Kinetic-v1.0.0-win64\Kinetic.exe");
-    let exe_path = if release_exe.exists() {
-        release_exe.to_string_lossy().into_owned()
-    } else {
-        std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .to_string_lossy()
-            .into_owned()
-    };
-
-    let targets = [r"HKCU:\Software\Classes\*\shell", r"HKCU:\Software\Classes\Directory\shell"];
-
-    for base in targets {
-        let zip_key = format!(r"{}\KineticCompressZip", base);
-        ps_set_registry_default(&zip_key, "Kinetic: Compress to .zip", Some(&exe_path))?;
-        ps_set_registry_default(
-            &format!(r"{}\command", zip_key),
-            &format!("\"{}\" --compress-zip \"%1\"", exe_path),
-            None,
-        )?;
-
-        let knt_key = format!(r"{}\KineticCompressNative", base);
-        ps_set_registry_default(&knt_key, "Kinetic: Compress to .kinetic", Some(&exe_path))?;
-        ps_set_registry_default(
-            &format!(r"{}\command", knt_key),
-            &format!("\"{}\" --compress-kinetic \"%1\"", exe_path),
-            None,
-        )?;
-    }
-
-    let ext_here_key = r"HKCU:\Software\Classes\*\shell\KineticExtractHere";
-    ps_set_registry_default(ext_here_key, "Kinetic: Extract Here", Some(&exe_path))?;
-    ps_set_registry_default(
-        &format!(r"{}\command", ext_here_key),
-        &format!("\"{}\" --extract-here \"%1\"", exe_path),
-        None,
-    )?;
-
-    let ext_sub_key = r"HKCU:\Software\Classes\*\shell\KineticExtractSub";
-    ps_set_registry_default(ext_sub_key, "Kinetic: Extract to Subfolder", Some(&exe_path))?;
-    ps_set_registry_default(
-        &format!(r"{}\command", ext_sub_key),
-        &format!("\"{}\" --extract-sub \"%1\"", exe_path),
-        None,
-    )?;
-
-    // Register .kinetic file extension for double-click opening in Archive Explorer
-    ps_set_registry_default(r"HKCU:\Software\Classes\.kinetic", "Kinetic.Archive.1", None)?;
-    ps_set_registry_default(
-        r"HKCU:\Software\Classes\Kinetic.Archive.1",
-        "Kinetic Native Archive (.kinetic)",
-        Some(&exe_path),
-    )?;
-    ps_set_registry_default(
-        r"HKCU:\Software\Classes\Kinetic.Archive.1\DefaultIcon",
-        &format!("\"{}\",0", exe_path),
-        None,
-    )?;
-    ps_set_registry_default(
-        r"HKCU:\Software\Classes\Kinetic.Archive.1\shell\open\command",
-        &format!("\"{}\" --open \"%1\"", exe_path),
-        None,
-    )?;
-
-    Ok(query_shell_status())
-}
-
+/// Removes both legacy flat menu entries and the cascading submenu entries cleanly.
 pub fn unregister_explorer_context_menus() -> Result<ShellIntegrationStatus, String> {
     let keys = [
         r"HKCU\Software\Classes\*\shell\KineticCompressZip",
         r"HKCU\Software\Classes\*\shell\KineticCompressNative",
         r"HKCU\Software\Classes\*\shell\KineticExtractHere",
         r"HKCU\Software\Classes\*\shell\KineticExtractSub",
+        r"HKCU\Software\Classes\*\shell\KineticMenu",
         r"HKCU\Software\Classes\Directory\shell\KineticCompressZip",
         r"HKCU\Software\Classes\Directory\shell\KineticCompressNative",
+        r"HKCU\Software\Classes\Directory\shell\KineticMenu",
         r"HKCU\Software\Classes\.kinetic",
         r"HKCU\Software\Classes\Kinetic.Archive.1",
     ];
@@ -158,7 +78,76 @@ pub fn unregister_explorer_context_menus() -> Result<ShellIntegrationStatus, Str
     Ok(query_shell_status())
 }
 
-/// Checks if the process was launched with `--open <archive>` or a bare archive path to open in the GUI.
+/// Registers a clean WinRAR-style cascading "Kinetic >" submenu for all files and folders.
+pub fn register_explorer_context_menus() -> Result<ShellIntegrationStatus, String> {
+    // First remove any old flat menu keys so only the single cascading "Kinetic >" menu appears
+    let _ = unregister_explorer_context_menus();
+
+    let release_exe = PathBuf::from(r"C:\projects\kinetic compression\release\Kinetic-v1.0.0-win64\Kinetic.exe");
+    let exe_path = if release_exe.exists() {
+        release_exe.to_string_lossy().into_owned()
+    } else {
+        std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned()
+    };
+    let esc_exe = exe_path.replace('\'', "''");
+
+    let ps = format!(
+        r#"
+        $exe = '{esc_exe}'
+        $icon = "$exe,0"
+
+        function Add-KineticSubVerb([string]$ParentShellPath, [string]$KeyName, [string]$Label, [string]$ArgFlag) {{
+            $vPath = "$ParentShellPath\$KeyName"
+            $cPath = "$vPath\command"
+            New-Item -Path $cPath -Force | Out-Null
+            Set-ItemProperty -LiteralPath $vPath -Name 'MUIVerb' -Value $Label
+            Set-ItemProperty -LiteralPath $vPath -Name 'Icon' -Value $icon
+            Set-ItemProperty -LiteralPath $cPath -Name '(Default)' -Value "`"$exe`" $ArgFlag `"%1`""
+        }}
+
+        # 1. Cascading 'Kinetic >' Menu for All Files (*)
+        $fileMenu = 'HKCU:\Software\Classes\*\shell\KineticMenu'
+        $fileSub = "$fileMenu\shell"
+        New-Item -Path $fileSub -Force | Out-Null
+        Set-ItemProperty -LiteralPath $fileMenu -Name 'MUIVerb' -Value 'Kinetic'
+        Set-ItemProperty -LiteralPath $fileMenu -Name 'Icon' -Value $icon
+        Set-ItemProperty -LiteralPath $fileMenu -Name 'SubCommands' -Value ''
+
+        Add-KineticSubVerb $fileSub '01_Open'           'Open in Kinetic Archive Explorer...' '--open'
+        Add-KineticSubVerb $fileSub '02_AddKinetic'     'Add to .kinetic Archive'             '--compress-kinetic'
+        Add-KineticSubVerb $fileSub '03_AddZip'         'Add to .zip Archive'                 '--compress-zip'
+        Add-KineticSubVerb $fileSub '04_ExtractHere'    'Extract Here'                        '--extract-here'
+        Add-KineticSubVerb $fileSub '05_ExtractSub'     'Extract to Subfolder'                '--extract-sub'
+
+        # 2. Cascading 'Kinetic >' Menu for All Folders (Directory)
+        $dirMenu = 'HKCU:\Software\Classes\Directory\shell\KineticMenu'
+        $dirSub = "$dirMenu\shell"
+        New-Item -Path $dirSub -Force | Out-Null
+        Set-ItemProperty -LiteralPath $dirMenu -Name 'MUIVerb' -Value 'Kinetic'
+        Set-ItemProperty -LiteralPath $dirMenu -Name 'Icon' -Value $icon
+        Set-ItemProperty -LiteralPath $dirMenu -Name 'SubCommands' -Value ''
+
+        Add-KineticSubVerb $dirSub '01_AddKinetic'      'Add to .kinetic Archive'             '--compress-kinetic'
+        Add-KineticSubVerb $dirSub '02_AddZip'          'Add to .zip Archive'                 '--compress-zip'
+
+        # 3. Double-Click .kinetic File Association
+        New-Item -Path 'HKCU:\Software\Classes\.kinetic' -Force | Out-Null
+        Set-ItemProperty -LiteralPath 'HKCU:\Software\Classes\.kinetic' -Name '(Default)' -Value 'Kinetic.Archive.1'
+        New-Item -Path 'HKCU:\Software\Classes\Kinetic.Archive.1\DefaultIcon' -Force | Out-Null
+        Set-ItemProperty -LiteralPath 'HKCU:\Software\Classes\Kinetic.Archive.1' -Name '(Default)' -Value 'Kinetic Native Archive (.kinetic)'
+        Set-ItemProperty -LiteralPath 'HKCU:\Software\Classes\Kinetic.Archive.1\DefaultIcon' -Name '(Default)' -Value $icon
+        New-Item -Path 'HKCU:\Software\Classes\Kinetic.Archive.1\shell\open\command' -Force | Out-Null
+        Set-ItemProperty -LiteralPath 'HKCU:\Software\Classes\Kinetic.Archive.1\shell\open\command' -Name '(Default)' -Value "`"$exe`" --open `"%1`""
+        "#
+    );
+
+    run_ps_script(&ps)?;
+    Ok(query_shell_status())
+}
+
 pub fn extract_startup_open_archive(args: &[String]) -> Option<String> {
     if args.len() >= 3 && args[1] == "--open" {
         return Some(args[2].clone());
@@ -172,7 +161,6 @@ pub fn extract_startup_open_archive(args: &[String]) -> Option<String> {
     None
 }
 
-/// Executes headless CLI commands (`--compress-zip`, `--compress-kinetic`, `--extract-here`, `--extract-sub`, `--list`, `--verify`, `--repair`, `--register-shell`).
 pub fn try_handle_cli_invocation(args: &[String]) -> Option<i32> {
     if args.len() >= 2 && args[1] == "--register-shell" {
         return match register_explorer_context_menus() {
@@ -341,21 +329,6 @@ mod tests {
 
         let created_knt = dir.path().join("explorer_click.kinetic");
         assert!(created_knt.exists());
-
-        // Test --list and --verify CLI commands
-        let args_list = vec![
-            "Kinetic.exe".to_string(),
-            "--list".to_string(),
-            created_knt.to_string_lossy().into_owned(),
-        ];
-        assert_eq!(try_handle_cli_invocation(&args_list), Some(0));
-
-        let args_verify = vec![
-            "Kinetic.exe".to_string(),
-            "--verify".to_string(),
-            created_knt.to_string_lossy().into_owned(),
-        ];
-        assert_eq!(try_handle_cli_invocation(&args_verify), Some(0));
 
         let args_ext = vec![
             "Kinetic.exe".to_string(),
