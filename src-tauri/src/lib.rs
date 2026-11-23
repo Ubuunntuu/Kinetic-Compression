@@ -1,13 +1,15 @@
 pub mod commands;
+pub mod shell;
 pub mod state;
 
 use commands::{
     append_entries_cmd, audit_archive_cmd, browse_filesystem_cmd, cancel_job_cmd,
     clear_recent_history, create_archive_cmd, delete_entry_cmd, extract_archive_cmd,
-    extract_selected_cmd, get_engine_status, get_live_telemetry_cmd, inspect_archive_cmd,
-    join_archive_cmd, pause_job_cmd, preview_entry_cmd, repair_archive_cmd, resume_job_cmd,
-    run_benchmark_suite_cmd, run_engine_pipeline_job_cmd, split_archive_cmd, update_user_config,
-    validate_archive_cmd,
+    extract_selected_cmd, get_engine_status, get_live_telemetry_cmd,
+    get_shell_integration_status_cmd, inspect_archive_cmd, join_archive_cmd, pause_job_cmd,
+    preview_entry_cmd, register_shell_context_menu_cmd, repair_archive_cmd, resume_job_cmd,
+    run_benchmark_suite_cmd, run_engine_pipeline_job_cmd, split_archive_cmd,
+    unregister_shell_context_menu_cmd, update_user_config, validate_archive_cmd,
 };
 use state::AppState;
 
@@ -37,7 +39,10 @@ pub fn run() {
             resume_job_cmd,
             cancel_job_cmd,
             run_engine_pipeline_job_cmd,
-            run_benchmark_suite_cmd
+            run_benchmark_suite_cmd,
+            get_shell_integration_status_cmd,
+            register_shell_context_menu_cmd,
+            unregister_shell_context_menu_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running Kinetic desktop application");

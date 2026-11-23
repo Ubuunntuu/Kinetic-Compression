@@ -707,6 +707,21 @@ pub fn run_benchmark_suite_cmd(
     let root = PathBuf::from(r"C:\projects\kinetic compression");
     kinetic_bench::run_full_benchmark_suite(&root, scale_mb.unwrap_or(4))
 }
+
+#[tauri::command]
+pub fn get_shell_integration_status_cmd() -> crate::shell::ShellIntegrationStatus {
+    crate::shell::query_shell_status()
+}
+
+#[tauri::command]
+pub fn register_shell_context_menu_cmd() -> Result<crate::shell::ShellIntegrationStatus, String> {
+    crate::shell::register_explorer_context_menus()
+}
+
+#[tauri::command]
+pub fn unregister_shell_context_menu_cmd() -> Result<crate::shell::ShellIntegrationStatus, String> {
+    crate::shell::unregister_explorer_context_menus()
+}
 #[cfg(test)]
 mod tests {
     use super::*;

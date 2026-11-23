@@ -7,7 +7,8 @@ pub mod zip_provider;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use kinetic_core::{ArchiveFormat, CompressionMode};
 use kinetic_format::archive::{
@@ -704,6 +705,10 @@ pub fn extract_selected_entries(
             }
 
             let mut cumulative_bytes = 0u64;
+            let mut unique_dirs: HashSet<PathBuf> = HashSet::new();
+            let mut file_tasks: Vec<(kinetic_format::archive::KineticFileEntry, PathBuf)> =
+                Vec::with_capacity(index.files.len());
+
             for entry in &index.files {
                 if !entry_matches_selection(&entry.path, &selected_set) {
                     continue;
@@ -718,7 +723,7 @@ pub fn extract_selected_entries(
 
                 if entry.is_dir {
                     let safe_rel = sanitize_relative_path(&entry.path)?;
-                    fs::create_dir_all(destination.join(safe_rel))?;
+                    unique_dirs.insert(destination.join(safe_rel));
                     continue;
                 }
 
@@ -726,56 +731,116 @@ pub fn extract_selected_entries(
                     resolve_extraction_target(destination, &entry.path, overwrite_policy)?
                 {
                     if let Some(parent) = target_path.parent() {
-                        fs::create_dir_all(parent)?;
+                        unique_dirs.insert(parent.to_path_buf());
                     }
-                    let max_entry_stream = entry
-                        .uncompressed_size
-                        .saturating_add(64 * 1024)
-                        .min(DEFAULT_MAX_EXTRACTION_BYTES);
-                    let out_file = File::create(&target_path)?;
-                    let mut bounded = BoundedExtractionWriter::new(out_file, max_entry_stream);
-                    let mut file_hasher = blake3::Hasher::new();
+                    file_tasks.push((entry.clone(), target_path));
+                }
+            }
 
-                    if entry.is_solid_slice {
-                        let bid = *entry.block_ids.first().ok_or_else(|| {
-                            CompatError::Format("Missing solid block ID".to_string())
-                        })?;
-                        let solid_block = block_cache.get(&bid).ok_or_else(|| {
+            // Pre-create all unique target directories once to eliminate redundant NTFS syscalls
+            for dir_path in unique_dirs {
+                fs::create_dir_all(&dir_path)?;
+            }
+
+            let shared_cache = Arc::new(block_cache);
+
+            let write_single_entry = |entry: &kinetic_format::archive::KineticFileEntry,
+                                      target_path: &Path,
+                                      cache: &HashMap<u32, Vec<u8>>|
+             -> Result<(), CompatError> {
+                let max_entry_stream = entry
+                    .uncompressed_size
+                    .saturating_add(64 * 1024)
+                    .min(DEFAULT_MAX_EXTRACTION_BYTES);
+                let out_file = File::create(target_path)?;
+                let buf_writer = BufWriter::with_capacity(64 * 1024, out_file);
+                let mut bounded = BoundedExtractionWriter::new(buf_writer, max_entry_stream);
+                let mut file_hasher = blake3::Hasher::new();
+
+                if entry.is_solid_slice {
+                    let bid = *entry.block_ids.first().ok_or_else(|| {
+                        CompatError::Format("Missing solid block ID".to_string())
+                    })?;
+                    let solid_block = cache.get(&bid).ok_or_else(|| {
+                        CompatError::Format(format!("Missing block ID {}", bid))
+                    })?;
+                    let start = entry.solid_offset as usize;
+                    let end = start + (entry.uncompressed_size as usize);
+                    if end > solid_block.len() {
+                        return Err(CompatError::Format("Solid slice out of bounds".to_string()));
+                    }
+                    let slice = &solid_block[start..end];
+                    file_hasher.update(slice);
+                    if let Err(e) = bounded.write_all(slice) {
+                        let _ = fs::remove_file(target_path);
+                        return Err(CompatError::Io(e));
+                    }
+                } else {
+                    for &bid in &entry.block_ids {
+                        let chunk = cache.get(&bid).ok_or_else(|| {
                             CompatError::Format(format!("Missing block ID {}", bid))
                         })?;
-                        let start = entry.solid_offset as usize;
-                        let end = start + (entry.uncompressed_size as usize);
-                        if end > solid_block.len() {
-                            return Err(CompatError::Format("Solid slice out of bounds".to_string()));
-                        }
-                        let slice = &solid_block[start..end];
-                        file_hasher.update(slice);
-                        if let Err(e) = bounded.write_all(slice) {
-                            let _ = fs::remove_file(&target_path);
+                        file_hasher.update(chunk);
+                        if let Err(e) = bounded.write_all(chunk) {
+                            let _ = fs::remove_file(target_path);
                             return Err(CompatError::Io(e));
                         }
-                    } else {
-                        for &bid in &entry.block_ids {
-                            let chunk = block_cache.get(&bid).ok_or_else(|| {
-                                CompatError::Format(format!("Missing block ID {}", bid))
-                            })?;
-                            file_hasher.update(chunk);
-                            if let Err(e) = bounded.write_all(chunk) {
-                                let _ = fs::remove_file(&target_path);
-                                return Err(CompatError::Io(e));
+                    }
+                }
+                bounded.flush()?;
+
+                let actual_blake3 = file_hasher.finalize().to_hex().to_string();
+                if actual_blake3 != entry.blake3_hex {
+                    let _ = fs::remove_file(target_path);
+                    return Err(CompatError::Format(format!(
+                        "BLAKE3 integrity verification failed for extracted file '{}'",
+                        entry.path
+                    )));
+                }
+                Ok(())
+            };
+
+            if file_tasks.len() <= 16 {
+                for (entry, target_path) in &file_tasks {
+                    write_single_entry(entry, target_path, &shared_cache)?;
+                }
+            } else {
+                let threads = std::thread::available_parallelism()
+                    .map(|n| n.get().saturating_sub(1).max(1))
+                    .unwrap_or(4)
+                    .min(file_tasks.len());
+                let (task_tx, task_rx) =
+                    bounded::<(kinetic_format::archive::KineticFileEntry, PathBuf)>(threads * 4);
+                let (err_tx, err_rx) = unbounded::<String>();
+
+                let mut handles = Vec::with_capacity(threads);
+                for _ in 0..threads {
+                    let rx = task_rx.clone();
+                    let tx = err_tx.clone();
+                    let cache_ref = Arc::clone(&shared_cache);
+                    handles.push(thread::spawn(move || {
+                        while let Ok((entry, target_path)) = rx.recv() {
+                            if let Err(e) = write_single_entry(&entry, &target_path, &cache_ref) {
+                                let _ = tx.send(e.to_string());
+                                break;
                             }
                         }
-                    }
-                    bounded.flush()?;
+                    }));
+                }
+                drop(task_rx);
+                drop(err_tx);
 
-                    let actual_blake3 = file_hasher.finalize().to_hex().to_string();
-                    if actual_blake3 != entry.blake3_hex {
-                        let _ = fs::remove_file(&target_path);
-                        return Err(CompatError::Format(format!(
-                            "BLAKE3 integrity verification failed for extracted file '{}'",
-                            entry.path
-                        )));
-                    }
+                for task in file_tasks {
+                    let _ = task_tx.send(task);
+                }
+                drop(task_tx);
+
+                let first_err = err_rx.into_iter().next();
+                for h in handles {
+                    let _ = h.join();
+                }
+                if let Some(msg) = first_err {
+                    return Err(CompatError::Format(msg));
                 }
             }
             Ok(cumulative_bytes)
