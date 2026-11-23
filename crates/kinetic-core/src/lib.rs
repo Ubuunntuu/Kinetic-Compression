@@ -8,7 +8,7 @@ use sysinfo::{Disks, System};
 use thiserror::Error;
 
 pub const ENGINE_NAME: &str = "Kinetic Engine";
-pub const ENGINE_VERSION: &str = "0.6.0-alpha";
+pub const ENGINE_VERSION: &str = "1.0.0";
 
 #[derive(Debug, Error)]
 pub enum EngineError {
